@@ -46,9 +46,10 @@ async def shot(app, name):
 
 
 def edge_box(width, height):
-    x, cy = appmod.load_anchor()  # physical px, on the monitor the tab is docked to
-    L, T, R, B, s = appmod.monitor_at(x, cy)
-    return (int(R - width * s), int(cy - height * s / 2), int(R), int(cy + height * s / 2))
+    x, y = appmod.load_anchor()  # widget top-left, physical px
+    L, T, R, B, s = appmod.monitor_at(x + 1, y + 1)
+    cy = y + appmod.MINI_H * s / 2
+    return (int(max(L, R - width * s)), int(cy - height * s / 2), int(R), int(cy + height * s / 2))
 
 
 def edge_shot(name, width=330, height=760):
@@ -112,8 +113,7 @@ async def run(app):
     if os.environ["RESMON_TEST"] == "dock":  # every way back to the tab, through the real window events
         def docked(label):
             b = appmod.window_bounds()
-            L, T, R, B, s = appmod.monitor_at(*app.anchor)
-            ok = app.mode == "tab" and b is not None and abs(b[0] + b[2] - R) < 3 and b[2] <= appmod.TAB_WIN_W * s + 2
+            ok = app.mode == "tab" and b is not None and all(abs(x - y) < 3 for x, y in zip(b, app.geometry("tab")))
             log(f"{label}: mode={app.mode} bounds=" + ("none" if b is None else "(%.0f, %.0f, %.0f x %.0f)" % b)
                 + f" -> {'OK' if ok else 'FAIL'}")
             return ok
