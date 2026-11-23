@@ -53,7 +53,7 @@ def edge_box(width, height):
 
 def edge_shot(name, width=330, height=760):
     """Real screen capture of the right edge of the work area, to see the tab/panel in place."""
-    ImageGrab.grab(bbox=edge_box(width, height)).save(os.path.join(OUT, name))
+    ImageGrab.grab(bbox=edge_box(width, height), all_screens=True).save(os.path.join(OUT, name))
     b = appmod.window_bounds()
     log(f"edge capture {name}; window bounds " + ("none" if b is None else "(%.0f, %.0f, %.0f x %.0f)" % b))
 
@@ -124,7 +124,8 @@ async def run(app):
             if go:
                 await go()
             log(f"phase {phase} at {time.time():.0f}")
-            await asyncio.sleep(secs)
+            await asyncio.sleep(2)  # skip the transition itself
+            await measure_cpu(app, secs - 2, phase)
         appmod.hard_exit()
     app.page.enable_screenshots = True
     if os.environ["RESMON_TEST"] == "dock":  # every way back to the tab, through the real window events
@@ -203,7 +204,7 @@ async def run(app):
         edge_shot("tab.png", 200, 400)
         frames = []
         for _ in range(6):  # tab bars between samples
-            frames.append(ImageGrab.grab(bbox=edge_box(60, 220)))
+            frames.append(ImageGrab.grab(bbox=edge_box(60, 220), all_screens=True))
             await asyncio.sleep(0.15)
         sheet(frames, "tab_frames.png", 6, 60)
         await measure_cpu(app, 40, "tab")  # also fills the 60 s history for the panel
@@ -214,7 +215,7 @@ async def run(app):
         edge_shot("panel.png")
         frames = []
         for _ in range(8):  # sparklines scrolling, bars easing
-            frames.append(ImageGrab.grab(bbox=edge_box(270, 300)))
+            frames.append(ImageGrab.grab(bbox=edge_box(270, 300), all_screens=True))
             await asyncio.sleep(0.25)
         sheet(frames, "panel_frames.png", 4, 270)
 
@@ -243,6 +244,21 @@ async def run(app):
         sheet(frames[:8], "glide_frames.png", 4, 520)
         log(f"glide: {len(frames)} frames in 0.9 s")
         await asyncio.sleep(1)
+        # share of total + per-core CPU, then memory as a share of total, then disk I/O via its card
+        app.toggle("relative")
+        app.toggle("per_core")
+        await shot(app, "cpu_share_per_core.png")
+        log(f"cpu share: tiles {[t['title'] for t in app.model if t.get('free')]}, whole {app.whole()}")
+        app.toggle("per_core")
+        app.set_metric("ws")
+        await asyncio.sleep(2)
+        await shot(app, "ram_share.png")
+        app.toggle("relative")
+        app.on_card(SimpleNamespace(control=SimpleNamespace(data="ram")))
+        log(f"MEMORY clicked again -> {app.metric}: {'OK' if app.metric == 'priv' else 'FAIL'}")
+        app.on_card(SimpleNamespace(control=SimpleNamespace(data="disk")))
+        await asyncio.sleep(3.5)
+        await shot(app, "disk_io.png")
         app.set_metric("ws")
 
         # --- actions on the dummy only

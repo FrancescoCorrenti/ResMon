@@ -45,6 +45,10 @@ class _SPI(ctypes.Structure):  # SYSTEM_PROCESS_INFORMATION, x64 layout
         ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
         ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
         ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t), ("PrivatePageCount", ctypes.c_size_t),
+        ("ReadOperationCount", ctypes.c_longlong), ("WriteOperationCount", ctypes.c_longlong),
+        ("OtherOperationCount", ctypes.c_longlong), ("ReadTransferCount", ctypes.c_longlong),
+        ("WriteTransferCount", ctypes.c_longlong), ("OtherTransferCount", ctypes.c_longlong),
     ]
 
 
@@ -53,7 +57,8 @@ _EPOCH_DIFF = 116444736000000000  # FILETIME 1601 -> 1970, in 100 ns
 
 
 def nt_processes():
-    """[(pid, ppid, name, threads, ws, private, cpu_100ns, create_epoch)] for every process."""
+    """[(pid, ppid, name, threads, ws, private, cpu_100ns, create_epoch, io_bytes)] for every process.
+    io_bytes = read + write transfer bytes: all file I/O, like Task Manager's I/O columns (cached reads too)."""
     size = ctypes.c_ulong(1 << 20)
     while True:
         buf = ctypes.create_string_buffer(size.value)
@@ -71,7 +76,8 @@ def nt_processes():
             name = ctypes.wstring_at(e.ImageName.Buffer, e.ImageName.Length // 2) if e.ImageName.Buffer else "System"
             out.append((pid, e.InheritedFromUniqueProcessId or 0, name, e.NumberOfThreads,
                         e.WorkingSetSize, e.PagefileUsage, e.UserTime + e.KernelTime,
-                        (e.CreateTime - _EPOCH_DIFF) / 1e7 if e.CreateTime else 0.0))
+                        (e.CreateTime - _EPOCH_DIFF) / 1e7 if e.CreateTime else 0.0,
+                        e.ReadTransferCount + e.WriteTransferCount))
         if not e.NextEntryOffset:
             return out
         off += e.NextEntryOffset
@@ -176,7 +182,22 @@ class Sampler:
         self._prev_cpu, self._prev_t, self._tot_t = {}, None, None
         self._disk = psutil.disk_io_counters()
         self._net = psutil.net_io_counters()
+        self._ticks, self._drives = 0, []
         psutil.cpu_percent(percpu=True)
+
+    @staticmethod
+    def drives():
+        """[(mount, used, total)] for local volumes with a file system (empty card readers are skipped)."""
+        out = []
+        for p in psutil.disk_partitions():
+            if not p.fstype or "cdrom" in p.opts or "remote" in p.opts:
+                continue
+            try:
+                u = psutil.disk_usage(p.mountpoint)
+            except OSError:
+                continue
+            out.append((p.mountpoint.rstrip("\\"), u.used, u.total))
+        return out
 
     def cmdline(self, pid, create):
         key = (pid, create)
@@ -215,7 +236,11 @@ class Sampler:
             h["vram"].append(gpu["mem_used"] / gpu["mem_total"] * 100)
         for k, v in rates.items():
             h[k].append(v)
+        if self._ticks % 20 == 0:  # drive space barely moves: every 10 s
+            self._drives = self.drives()
+        self._ticks += 1
         return {"cpu": cpu, "per_core": per_core, "ram_used": vm.used, "ram_total": vm.total,
+                "drives": self._drives,
                 "commit": commit, "commit_limit": commit_limit, "gpu": gpu, "rates": rates,
                 "pdh_ok": self.pdh is not None, "gpu_err": self.gpu_err}
 
@@ -226,16 +251,17 @@ class Sampler:
         self._prev_t = now
         gutil, gmem = self.pdh.sample() if self.pdh else ({}, {})
         procs, cur_cpu, live = [], {}, set()
-        for pid, ppid, name, thr, ws, priv, t100, create in nt_processes():
+        for pid, ppid, name, thr, ws, priv, t100, create, io in nt_processes():
             key = (pid, create)
             live.add(key)
-            cur_cpu[key] = t100
+            cur_cpu[key] = (t100, io)
             prev = self._prev_cpu.get(key)
-            pcpu = 0.0
+            pcpu = pio = 0.0
             if dt and prev is not None:
-                pcpu = max(0.0, (t100 - prev) / 1e7 / dt * 100.0 / self.ncpu)  # % of whole machine
+                pcpu = max(0.0, (t100 - prev[0]) / 1e7 / dt * 100.0 / self.ncpu)  # % of whole machine
+                pio = max(0.0, (io - prev[1]) / dt)  # bytes/s
             procs.append({"pid": pid, "ppid": ppid, "name": name, "threads": thr, "ws": ws, "priv": priv,
-                          "cpu": pcpu, "create": create, "gpu_mem": gmem.get(pid, 0),
+                          "cpu": pcpu, "io": pio, "create": create, "gpu_mem": gmem.get(pid, 0),
                           "gpu": gutil.get(pid, 0.0), "cmd": self.cmdline(pid, create)})
         self._prev_cpu = cur_cpu
         for key in [k for k in self._cmd if k not in live]:
@@ -309,13 +335,35 @@ class Sticky:
 HEADER = 18  # px of the app-name band on a group tile
 
 
-def treemap_model(procs, field, zoom, W, H, sticky):
+def whole_parts(live, field, whole):
+    """Relative-to-total mode: whole = (total, used or None, free label), in the field's units.
+    Returns [(value, label)]: 'Other' (used but not by the shown processes: kernel, drivers, other apps
+    when zoomed) and the free part. Shared pages can make the processes sum past `used`: no 'Other' then."""
+    if not whole:
+        return []
+    total, used, free_label = whole
+    s = sum(q[field] for q in live)
+    used = s if used is None else max(used, s)
+    return [(v, k) for k, v in (("Other", used - s), (free_label, total - used)) if v > 0]
+
+
+def treemap_model(procs, field, zoom, W, H, sticky, whole=None):
     """Pure layout (runs in the sampler thread). Returns tiles:
-    {key, hit, x, y, w, h, title, value, name, cpu, header} where key is stable per app ('g', name)
-    or per process ('p', pid); hit is what a click selects."""
+    {key, hit, x, y, w, h, title, value, name, cpu, header, free} where key is stable per app ('g', name),
+    per process ('p', pid) or per partition ('x', label); hit is what a click selects (None: nothing)."""
     live = [q for q in procs if q[field] > 0 and (zoom is None or q["name"] == zoom)]
-    sv = sticky.update({q["pid"]: float(q[field]) for q in live})
+    parts = whole_parts(live, field, whole)
+    vals = {q["pid"]: float(q[field]) for q in live}
+    part_val = {k: v for v, k in parts}
+    vals.update({k: float(v) for k, v in part_val.items()})
+    sv = sticky.update(vals)
     tiles = []
+    extra = [(sv[k], ("x", k)) for k in part_val]  # appended after the processes: the free part fills the corner
+
+    def part(key, x, y, w, h):
+        tiles.append({"key": key, "hit": None, "x": x + 1, "y": y + 1, "w": w - 2, "h": h - 2,
+                      "title": key[1], "value": part_val[key[1]], "name": key[1], "cpu": 0.0,
+                      "header": False, "free": True})
 
     def leaf(q, x, y, w, h, title, value):
         if w >= 7 and h >= 7:  # specks are left to the group frame: fewer controls to animate
@@ -327,15 +375,21 @@ def treemap_model(procs, field, zoom, W, H, sticky):
         return sorted(qs, key=lambda q: (-sv[q["pid"]], q["pid"]))
 
     if zoom:
-        for q, x, y, w, h in squarify([(sv[q["pid"]], q) for q in order(live)], 0, 0, W, H):
-            leaf(q, x, y, w, h, f"PID {q['pid']}", q[field])
+        for q, x, y, w, h in squarify([(sv[q["pid"]], q) for q in order(live)] + extra, 0, 0, W, H):
+            if isinstance(q, tuple):
+                part(q, x, y, w, h)
+            else:
+                leaf(q, x, y, w, h, f"PID {q['pid']}", q[field])
         return tiles
     groups = {}
     for q in live:
         groups.setdefault(q["name"], []).append(q)
     totals = sorted(((sum(sv[q["pid"]] for q in qs), name) for name, qs in groups.items()),
                     key=lambda t: (-t[0], t[1]))
-    for name, x, y, w, h in squarify(totals, 0, 0, W, H):
+    for name, x, y, w, h in squarify(totals + extra, 0, 0, W, H):
+        if isinstance(name, tuple):
+            part(name, x, y, w, h)
+            continue
         qs = groups[name]
         real = sum(q[field] for q in qs)
         cpu = sum(q["cpu"] for q in qs)
@@ -376,6 +430,16 @@ if __name__ == "__main__":
     me = next(p for p in nt_processes() if p[0] == psutil.Process().pid)
     assert me[2].lower().startswith("python"), me
     assert abs(me[4] - psutil.Process().memory_info().rss) < 50e6
+    io = psutil.Process().io_counters()
+    assert abs(me[8] - (io.read_bytes + io.write_bytes)) < 1e6, (me[8], io)  # struct offsets of the I/O counters
+    # relative-to-total: processes + Other + Free tile the whole machine
+    qs = [{"pid": 1, "name": "a", "ws": 30.0, "cpu": 0.0}, {"pid": 2, "name": "b", "ws": 10.0, "cpu": 0.0}]
+    assert whole_parts(qs, "ws", (100, 60, "Free")) == [(20, "Other"), (40, "Free")]
+    assert whole_parts(qs, "ws", (100, 35, "Free")) == [(60, "Free")]  # shared pages: no negative Other
+    tl = treemap_model(qs, "ws", None, 400, 300, Sticky(0.15), (100, 60, "Free"))
+    assert {t["key"] for t in tl} == {("p", 1), ("p", 2), ("x", "Other"), ("x", "Free")}
+    free = next(t for t in tl if t["key"] == ("x", "Free"))
+    assert abs((free["w"] + 2) * (free["h"] + 2) / (400 * 300) - 0.4) < 1e-6
     # hysteresis: a 5% wobble keeps the layout value, a 30% jump moves it
     st = Sticky(0.15)
     st.update({"a": 100.0, "b": 50.0})

@@ -27,7 +27,7 @@ REFLOW = 8.0                    # seconds: minimum time between two treemap refl
 TAB_W, TAB_H = 26, 168          # docked tab (logical px)
 TAB_WIN_W = 160                 # window width while docked: above Windows' minimum
 HOVER_OPEN = 2.0                # seconds resting on the tab before the panel opens (time to grab and drag it)
-PANEL_W, PANEL_H = 264, 660     # hover panel
+PANEL_W, PANEL_H = 264, 790     # hover panel
 FULL_W, FULL_H = 1440, 900      # full view (clamped to the work area)
 EASE = ft.AnimationCurve.EASE_OUT_CUBIC
 UI_ANIM = ft.Animation(280, EASE)        # shell transitions
@@ -36,15 +36,19 @@ UI_ANIM = ft.Animation(280, EASE)        # shell transitions
 VALUE_ANIM = None
 TILE_ANIM = ft.Animation(550, EASE)      # treemap tiles glide
 
-BG, CARD, LINE = "#0E1014", "#161920", "#232733"
-TEXT, MUTED, FAINT = "#E8EAF0", "#8A90A0", "#5A6070"
-ACCENT = {"cpu": "#5AB8FF", "ram": "#B48CFF", "commit": "#8C7BD6", "gpu": "#4ADE9A", "vram": "#F5C451",
-          "disk": "#FF8A65", "disk2": "#FFC2A8", "net": "#4DD6E6", "net2": "#B4F0F7"}
-DANGER = "#FF5C6C"
+# monochrome shell; colour is kept for data only (sparklines, bars, tiles)
+BG, CARD, LINE = "#0B0D11", "#13161C", "#1F232C"
+SEL_BG, SEL_LINE = "#1A1F29", "#4A5468"   # the card that sizes the treemap
+TEXT, MUTED, FAINT = "#E6E8EE", "#8B91A0", "#566070"
+ACCENT = {"cpu": "#6CB6F5", "ram": "#A993E8", "commit": "#8A80C8", "gpu": "#5CCB98", "vram": "#E0BC62",
+          "disk": "#E8957A", "disk2": "#F2C7B6", "net": "#62C6D4", "net2": "#B6E6EC"}
+DANGER = "#F06272"
 PALETTE = ["#3D7FD9", "#8C5BD6", "#D6508F", "#D99A2B", "#2FA57A", "#2AA6BF",
            "#D9573D", "#7DAA2F", "#5B63D6", "#2F9C94", "#C2732E", "#A24FC9"]
-METRICS = {"ws": ("RAM", "ws"), "priv": ("Private", "priv"), "cpu": ("CPU", "cpu"),
-           "gpu_mem": ("VRAM", "gpu_mem"), "gpu": ("GPU", "gpu")}  # key -> (pill label, process field)
+METRIC_LABEL = {"ws": "memory", "priv": "private bytes", "cpu": "CPU", "gpu_mem": "VRAM", "gpu": "GPU load",
+                "io": "disk I/O"}  # process field -> name
+CARD_METRIC = {"cpu": "cpu", "ram": "ws", "gpu": "gpu", "vram": "gpu_mem", "disk": "io"}  # clickable cards
+LABEL = ft.TextStyle(size=10, weight=ft.FontWeight.W_600, letter_spacing=0.8)
 
 # ---------------------------------------------------------------- Windows glue (physical px, per monitor)
 # Monitors can have different scales (e.g. a 150% laptop next to a 100% screen), so every position is in
@@ -191,8 +195,13 @@ def fmt_rate(b):
     return fmt_bytes(b) + "/s"
 
 
-def fmt_metric(key, v):
-    return f"{v:.1f}%" if key in ("cpu", "gpu") else fmt_bytes(v)
+def fmt_metric(key, v, cpu_scale=1):
+    """cpu_scale = number of cores in per-core mode (100% = one core), else 1 (100% = whole machine)."""
+    if key == "cpu":
+        return f"{v * cpu_scale:.1f}%"
+    if key == "gpu":
+        return f"{v:.1f}%"
+    return fmt_rate(v) if key == "io" else fmt_bytes(v)
 
 
 def mix(c1, c2, t):
@@ -246,18 +255,24 @@ class Gauge:
             third = ft.Row(tracks, spacing=3, height=12)
         else:
             third = self.sub
-        dot = ft.Container(width=7, height=7, bgcolor=color, border_radius=4)
+        self.title = ft.Text(title, style=LABEL, color=MUTED, expand=small, no_wrap=True)
         if small:  # label and value on one line
-            head = ft.Row([dot, ft.Text(title, size=10, color=MUTED, weight=ft.FontWeight.W_700, expand=True),
-                           self.value], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            head = ft.Row([self.title, self.value], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER)
             rows = [head, third, self.spark]
         else:
-            head = ft.Row([dot, ft.Text(title, size=10, color=MUTED, weight=ft.FontWeight.W_700)], spacing=6)
-            rows = [head, self.value, third, self.spark]
+            rows = [self.title, self.value, third, self.spark]
         self.view = ft.Container(ft.Column(rows, spacing=3, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
                                  padding=ft.Padding.only(left=12, right=12, top=8 if small else 10,
                                                          bottom=6 if small else 8),
-                                 bgcolor=CARD, border_radius=12, expand=1)
+                                 bgcolor=CARD, border=ft.Border.all(1, CARD), border_radius=12, expand=1)
+
+    def select(self, on, title=None):
+        """The card that sizes the treemap: lifted background, hairline border, bright label."""
+        self.view.bgcolor = SEL_BG if on else CARD
+        self.view.border = ft.Border.all(1, SEL_LINE if on else CARD)
+        self.title.color = TEXT if on else MUTED
+        if title:
+            self.title.value = title
 
     def _resize(self, e):
         self.w = e.width
@@ -292,6 +307,35 @@ class Gauge:
     def set_cores(self, per_core):
         for f, v in zip(self.fills, per_core):
             f.offset = ft.Offset(0, round(1 - max(0.1, v / 100), 2))
+
+
+class Drives:
+    """Space per volume: a thin bar and the free space."""
+
+    def __init__(self, small):
+        self.small, self.keys = small, None
+        self.rows = ft.Column(spacing=5 if small else 6)
+        self.view = ft.Container(ft.Column([ft.Text("DRIVES", style=LABEL, color=MUTED), self.rows],
+                                           spacing=6, scroll=None if small else ft.ScrollMode.AUTO),
+                                 padding=ft.Padding.only(left=12, right=12, top=8 if small else 10, bottom=8),
+                                 bgcolor=CARD, border=ft.Border.all(1, CARD), border_radius=12,
+                                 expand=None if small else 1)
+
+    def set(self, drives):
+        if [d[0] for d in drives] != self.keys:
+            self.keys = [d[0] for d in drives]
+            self.rows.controls = [ft.Row([ft.Text("", size=11, color=TEXT, width=20),
+                                          ft.ProgressBar(value=0, bar_height=4, border_radius=2, bgcolor=LINE,
+                                                         expand=True),
+                                          ft.Text("", size=11, color=MUTED, no_wrap=True)],
+                                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+                                  for _ in drives]
+        for row, (mount, used, total) in zip(self.rows.controls, drives):
+            name, bar, free = row.controls
+            name.value, bar.value = mount, used / total if total else 0
+            bar.color = DANGER if bar.value > 0.9 else MUTED
+            free.value = f"{fmt_bytes(total - used)} free"
+            row.tooltip = f"{mount}  {fmt_bytes(used)} used of {fmt_bytes(total)}"
 
 
 # ---------------------------------------------------------------- treemap tile (persistent, animated)
@@ -353,7 +397,10 @@ class ResMon:
         self.sampler = Sampler()
         self.tot = None
         self.procs, self.by_pid, self.groups = [], {}, {}
-        self.metric, self.color_mode = "ws", "app"
+        self.metric, self.color_mode = "ws", "app"   # metric = the process field that sizes the treemap
+        self.relative = False         # treemap as a share of the machine total (Other + Free tiles)
+        self.per_core = False         # CPU % where 100% = one core (top style) instead of the whole machine
+        self.ncpu = psutil.cpu_count() or 1
         self.zoom = None              # app name when drilled into one app
         self.sel = None               # ("pid", pid) | ("group", name)
         self.hover = None
@@ -433,18 +480,27 @@ class ResMon:
             return G
 
         self.G_full, self.G_panel = gauges(False), gauges(True)
-        self.header = isolate(ft.Container(ft.Row([g.view for g in self.G_full.values()], spacing=10,
-                                                  vertical_alignment=ft.CrossAxisAlignment.STRETCH), height=112), 112)
+        self.D_full, self.D_panel = Drives(False), Drives(True)
+        for key, metric in CARD_METRIC.items():  # the cards are the metric picker
+            v = self.G_full[key].view
+            v.data, v.on_click = key, self.on_card
+            v.tooltip = f"Size the treemap by {METRIC_LABEL[metric]}" + (
+                " (click again for private bytes)" if key == "ram" else "")
+        self.header = isolate(ft.Container(ft.Row([g.view for g in self.G_full.values()] + [self.D_full.view],
+                                                  spacing=10, vertical_alignment=ft.CrossAxisAlignment.STRETCH),
+                                           height=112), 112)
 
         # treemap toolbar
         self.crumb = ft.Row(spacing=4, tight=True)
         self.count = ft.Text("", size=12, color=FAINT)
         self.pill_paint = {}
-        metric_pills = self.pill_group([(k, v[0]) for k, v in METRICS.items()], "metric", self.set_metric)
+        rel_pill = self.pill_group([(True, "Share of total")], "relative", lambda k: self.toggle("relative"))
+        rel_pill.tooltip = "Size tiles against the machine total, with the free part as its own tile"
+        self.rel_pill = rel_pill
+        core_pill = self.pill_group([(True, "Per core")], "per_core", lambda k: self.toggle("per_core"))
+        core_pill.tooltip = "CPU %: 100% = one full core (like top), instead of 100% = the whole machine"
         color_pills = self.pill_group([("app", "App"), ("heat", "CPU heat")], "color_mode", self.set_color)
-        toolbar = ft.Row([self.crumb, self.count, ft.Container(expand=True),
-                          ft.Text("Size", size=12, color=FAINT), metric_pills,
-                          ft.Container(width=8), ft.Text("Colour", size=12, color=FAINT), color_pills],
+        toolbar = ft.Row([self.crumb, self.count, ft.Container(expand=True), rel_pill, core_pill, color_pills],
                          spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
         # treemap: persistent tile controls + two animated outlines + tooltip, under one gesture detector
@@ -475,27 +531,24 @@ class ResMon:
                               size_change_interval=150)
 
         # selection bar
-        self.sel_dot = ft.Container(width=10, height=10, border_radius=5, animate=UI_ANIM)
         self.sel_text = ft.Text("", size=12, color=MUTED, no_wrap=True, overflow=ft.TextOverflow.ELLIPSIS,
                                 expand=True)
 
-        def act(icon, label, fn, color=MUTED):
-            return ft.TextButton(content=ft.Text(label, size=12), icon=icon, icon_color=color, on_click=fn,
+        def act(label, fn, color=MUTED):  # text only: the labels already say what they do
+            return ft.TextButton(content=ft.Text(label, size=12), on_click=fn,
                                  style=ft.ButtonStyle(color=color, padding=ft.Padding.symmetric(horizontal=10)))
 
         self.prio = ft.PopupMenuButton(
-            content=ft.Row([ft.Icon(ft.Icons.SPEED, size=16, color=MUTED), ft.Text("Priority", size=12, color=MUTED)],
-                           spacing=6, tight=True),
+            content=ft.Text("Priority", size=12, color=MUTED),
             items=[ft.PopupMenuItem(content=ft.Text(t), data=v, on_click=self.set_priority) for t, v in (
                 ("Idle", psutil.IDLE_PRIORITY_CLASS), ("Below normal", psutil.BELOW_NORMAL_PRIORITY_CLASS),
                 ("Normal", psutil.NORMAL_PRIORITY_CLASS))], tooltip="Set priority")
-        self.actions = ft.Row([act(ft.Icons.TAG, "Copy PID", self.copy_pid),
-                               act(ft.Icons.TERMINAL, "Copy command line", self.copy_cmd),
-                               act(ft.Icons.FOLDER_OPEN_OUTLINED, "Open location", self.open_location),
-                               ft.Container(self.prio, padding=ft.Padding.symmetric(horizontal=8)),
-                               act(ft.Icons.CLOSE, "End task", self.ask_kill, DANGER)], spacing=0,
+        self.actions = ft.Row([act("Copy PID", self.copy_pid), act("Copy command line", self.copy_cmd),
+                               act("Open location", self.open_location),
+                               ft.Container(self.prio, padding=ft.Padding.symmetric(horizontal=10)),
+                               act("End task", self.ask_kill, DANGER)], spacing=0,
                               opacity=0, animate_opacity=UI_ANIM, disabled=True)
-        self.selbar = ft.Container(ft.Row([self.sel_dot, self.sel_text, self.actions], spacing=10,
+        self.selbar = ft.Container(ft.Row([self.sel_text, self.actions], spacing=10,
                                           vertical_alignment=ft.CrossAxisAlignment.CENTER),
                                    bgcolor=CARD, border_radius=10, padding=ft.Padding.symmetric(horizontal=12),
                                    height=40)
@@ -503,10 +556,10 @@ class ResMon:
         # table: a fixed pool of rows, values mutated in place
         self.cols = [("name", "Name", 210, False), ("pid", "PID", 70, True), ("cpu", "CPU", 64, True),
                      ("ws", "RAM", 82, True), ("priv", "Private", 82, True), ("gpu_mem", "VRAM", 82, True),
-                     ("gpu", "GPU", 60, True), ("threads", "Threads", 64, True), ("create", "Started", 110, True),
-                     ("cmd", "Command line", None, False)]
+                     ("gpu", "GPU", 60, True), ("io", "Disk I/O", 90, True), ("threads", "Threads", 64, True),
+                     ("create", "Started", 110, True), ("cmd", "Command line", None, False)]
         self.search = ft.TextField(hint_text="Filter by name, PID or command line", dense=True, height=36,
-                                   text_size=13, prefix_icon=ft.Icons.SEARCH, border=ft.NoInputBorder(),
+                                   text_size=13, border=ft.NoInputBorder(),
                                    content_padding=ft.Padding.symmetric(horizontal=10, vertical=8),
                                    on_change=self.on_search)
         self.table_info = ft.Text("", size=12, color=FAINT)
@@ -543,7 +596,6 @@ class ResMon:
             self.startup_item, ft.PopupMenuItem(content=ft.Text("Quit ResMon"), on_click=self.quit)])
         topbar = ft.Row([
             ft.WindowDragArea(ft.Container(ft.Row([
-                ft.Container(width=10, height=10, border_radius=5, bgcolor=ACCENT["cpu"]),
                 ft.Text("ResMon", size=13, weight=ft.FontWeight.W_700, color=TEXT),
                 ft.Text("drag to move · Esc to dock", size=11, color=FAINT)], spacing=8),
                 height=30, padding=ft.Padding.only(left=4)), expand=True),
@@ -576,8 +628,9 @@ class ResMon:
                          width=TAB_W, height=TAB_H, bgcolor="#F2222631",
                          border=ft.Border.all(1, "#3A4150"), padding=ft.Padding.only(left=3),
                          border_radius=ft.BorderRadius.only(top_left=12, bottom_left=12)),
+            # hand on hover (it is a button); the move cursor only once it is held: a drag or a long press
             on_tap=self.to_full, on_secondary_tap=self.to_panel, on_pan_start=self.start_drag,
-            mouse_cursor=ft.MouseCursor.MOVE)
+            on_long_press_start=self.start_drag, mouse_cursor=ft.MouseCursor.CLICK)
 
         # ---- hover panel: slides in from the right edge
         def foot(icon, tip, fn, color=MUTED):
@@ -588,8 +641,8 @@ class ResMon:
         panel_col = ft.Column(
             [ft.Row([ft.Text("ResMon", size=13, weight=ft.FontWeight.W_700, color=TEXT, expand=True),
                      ft.Text("click for details", size=10, color=FAINT)])]
-            + [g.view for g in self.G_panel.values()]
-            + [ft.Row([foot(ft.Icons.OPEN_IN_FULL, "Open full monitor", self.to_full, ACCENT["cpu"]),
+            + [g.view for g in self.G_panel.values()] + [self.D_panel.view]
+            + [ft.Row([foot(ft.Icons.OPEN_IN_FULL, "Open full monitor", self.to_full, TEXT),
                        ft.Container(expand=True), self.startup_btn,
                        foot(ft.Icons.LOGOUT, "Quit ResMon", self.quit)], spacing=0)],
             spacing=6, expand=True)
@@ -608,6 +661,7 @@ class ResMon:
         self.render_crumb()
         self.paint_sort()
         self.render_selbar()
+        self.paint_cards()
 
     # ------------------------------------------------------------ gauges (fast loop)
     def render_totals(self):
@@ -617,9 +671,10 @@ class ResMon:
             for bar, v in zip(self.tab_bars, (s["cpu"], s["ram_used"] / s["ram_total"] * 100, g.get("util") or 0)):
                 bar.offset = ft.Offset(0, round(1 - max(0.02, v / 100), 3))
             return [self.tab_view]
-        G = self.G_panel if self.mode == "panel" else self.G_full
+        G, D = (self.G_panel, self.D_panel) if self.mode == "panel" else (self.G_full, self.D_full)
         self.update_gauges(G)
-        return [g.view for g in G.values()]
+        D.set(s["drives"])
+        return [g.view for g in G.values()] + [D.view]
 
     def update_gauges(self, G):
         s, h = self.tot, self.sampler.hist
@@ -665,9 +720,33 @@ class ResMon:
         """Treemap model for the current state (pure; ~1 ms, safe to run in a thread)."""
         if not self.tm_w:
             return []
-        return treemap_model(self.procs, METRICS[self.metric][1], self.zoom, self.tm_w, self.tm_h, self.sticky)
+        return treemap_model(self.procs, self.metric, self.zoom, self.tm_w, self.tm_h, self.sticky, self.whole())
+
+    def whole(self):
+        """(total, used, free label) of the machine in the metric's units, for 'Share of total'; None when
+        off or meaningless (disk I/O has no fixed maximum)."""
+        s, m = self.tot, self.metric
+        if not self.relative or not s:
+            return None
+        g = s["gpu"]
+        if m == "ws":
+            return s["ram_total"], s["ram_used"], "Free"
+        if m == "priv":
+            return s["commit_limit"], s["commit"], "Free"
+        if m == "cpu":  # processes are in % of the machine whatever the per-core display
+            return 100.0, s["cpu"], "Idle"
+        if m == "gpu" and g.get("util") is not None:
+            return 100.0, float(g["util"]), "Idle"
+        if m == "gpu_mem" and g.get("mem_total"):
+            return g["mem_total"], g["mem_used"], "Free"
+        return None
+
+    def cpu_scale(self):
+        return self.ncpu if self.per_core else 1
 
     def tile_color(self, t):
+        if t.get("free"):
+            return "#1C2029" if t["name"] == "Other" else "#15181F"
         if self.color_mode == "heat":
             return heat_color(quantize(t["cpu"]))
         return mix(app_color(t["name"]), BG, 0.25)
@@ -694,7 +773,7 @@ class ResMon:
             if tile is None:
                 tile = self.tile_ctl[t["key"]] = Tile(t)
                 order_changed = True
-            if tile.set(t, self.tile_color(t), fmt_metric(self.metric, t["value"])):
+            if tile.set(t, self.tile_color(t), fmt_metric(self.metric, t["value"], self.cpu_scale())):
                 dirty.append(tile.view)
         if order_changed:  # groups must stay under their children: keep the stack in model order
             self.tile_stack.controls = [self.tile_ctl[k].view for k in keys]
@@ -702,12 +781,14 @@ class ResMon:
         self.rects = {t["key"]: (t["x"], t["y"], t["w"], t["h"]) for t in model}
         hits = []
         for t in reversed(model):  # children were laid out after their group: test them first
-            h = HEADER if t["header"] else t["h"]
-            hits.append((t["x"], t["y"], t["w"], h) + t["hit"])
+            if t["hit"]:
+                h = HEADER if t["header"] else t["h"]
+                hits.append((t["x"], t["y"], t["w"], h) + t["hit"])
         self.hits = hits
         self.empty.visible = not model and bool(self.procs)
-        n = len(self.groups.get(self.zoom, [])) if self.zoom else len({t["name"] for t in model})
-        self.count.value = f"{n} processes" if self.zoom else f"{n} apps · {len(self.procs)} processes"
+        n = len(self.groups.get(self.zoom, [])) if self.zoom else len({t["name"] for t in model if t["hit"]})
+        by = f"Sized by {METRIC_LABEL[self.metric]}" + (" · share of total" if self.whole() else "")
+        self.count.value = f"{by}  ·  " + (f"{n} processes" if self.zoom else f"{n} apps · {len(self.procs)} processes")
         self.paint_outlines()
         return dirty + [self.hl_sel, self.hl_hover, self.empty, self.count]
 
@@ -763,6 +844,7 @@ class ResMon:
     def describe(self, target):
         kind, key = target
         pdh = self.tot["pdh_ok"] if self.tot else False
+        k = self.cpu_scale()
         if kind == "pid":
             q = self.by_pid.get(key)
             if not q:
@@ -770,15 +852,17 @@ class ResMon:
             gm = f"{fmt_bytes(q['gpu_mem'])} VRAM · {q['gpu']:.0f}% GPU" if pdh else "GPU n/a"
             body = (f"PID {q['pid']}  ·  parent {q['ppid']}  ·  {self.username(q['pid'])}\n"
                     f"RAM {fmt_bytes(q['ws'])}  ·  private {fmt_bytes(q['priv'])}\n"
-                    f"CPU {q['cpu']:.1f}%  ·  {gm}  ·  {q['threads']} threads\n"
+                    f"CPU {q['cpu'] * k:.1f}%  ·  {gm}  ·  {q['threads']} threads\n"
+                    f"Disk I/O {fmt_rate(q['io'])}\n"
                     f"{(q['cmd'] or '(command line not accessible)')[:300]}")
             return q["name"], body
         qs = self.groups.get(key, [])
         pids = ", ".join(str(q["pid"]) for q in qs[:12]) + (" …" if len(qs) > 12 else "")
         body = (f"{len(qs)} processes  ·  PIDs {pids}\n"
                 f"RAM {fmt_bytes(sum(q['ws'] for q in qs))}  ·  private {fmt_bytes(sum(q['priv'] for q in qs))}\n"
-                f"CPU {sum(q['cpu'] for q in qs):.1f}%  ·  {fmt_bytes(sum(q['gpu_mem'] for q in qs))} VRAM  ·  "
+                f"CPU {sum(q['cpu'] for q in qs) * k:.1f}%  ·  {fmt_bytes(sum(q['gpu_mem'] for q in qs))} VRAM  ·  "
                 f"{max((q['gpu'] for q in qs), default=0):.0f}% GPU\n"
+                f"Disk I/O {fmt_rate(sum(q['io'] for q in qs))}\n"
                 f"Double-click to show its processes")
         return key, body
 
@@ -837,8 +921,33 @@ class ResMon:
 
     def set_metric(self, key):
         self.metric = key
-        self.pill_paint["metric"]()
+        self.paint_cards()
         self.relayout()
+
+    def on_card(self, e):
+        """Click a gauge card: it sizes the treemap. MEMORY clicked again flips working set / private bytes."""
+        key = e.control.data
+        metric = CARD_METRIC[key]
+        if key == "ram" and self.metric in ("ws", "priv"):
+            metric = "priv" if self.metric == "ws" else "ws"
+        self.set_metric(metric)
+
+    def paint_cards(self):
+        for key, metric in CARD_METRIC.items():
+            on = self.metric == metric or (key == "ram" and self.metric == "priv")
+            self.G_full[key].select(on, ("MEMORY · PRIVATE" if self.metric == "priv" else "MEMORY")
+                                    if key == "ram" else None)
+        self.rel_pill.opacity = 1 if self.metric != "io" else 0.4  # disk I/O has no total to share
+
+    def toggle(self, attr):
+        setattr(self, attr, not getattr(self, attr))
+        self.pill_paint[attr]()
+        if attr == "relative":
+            self.relayout()
+        else:  # per-core only changes the numbers
+            self.render_treemap(self.model, reflow=False)
+            self.render_table()
+            self.render_selbar()
 
     def set_color(self, key):
         self.color_mode = key
@@ -863,19 +972,18 @@ class ResMon:
         qs = self.selected_procs()
         self.actions.opacity, self.actions.disabled = (1, False) if qs else (0, True)
         if not qs:
-            self.sel_dot.bgcolor = FAINT
-            self.sel_text.value = "Click a tile or a row to select it. Double-click an app to see its processes."
+            self.sel_text.value = ("Click a tile or a row to select it. Double-click an app to see its processes. "
+                                   "Click a card above to size the treemap by it.")
             self.sel_text.color = MUTED
             return
-        name = qs[0]["name"]
-        self.sel_dot.bgcolor = app_color(name)
+        name, k = qs[0]["name"], self.cpu_scale()
         self.sel_text.color = TEXT
         if self.sel[0] == "pid":
             q = qs[0]
-            self.sel_text.value = f"{name}   PID {q['pid']}   ·   {fmt_bytes(q['ws'])}   ·   CPU {q['cpu']:.1f}%"
+            self.sel_text.value = f"{name}   PID {q['pid']}   ·   {fmt_bytes(q['ws'])}   ·   CPU {q['cpu'] * k:.1f}%"
         else:
             self.sel_text.value = (f"{name}   {len(qs)} processes   ·   {fmt_bytes(sum(q['ws'] for q in qs))}"
-                                   f"   ·   CPU {sum(q['cpu'] for q in qs):.1f}%")
+                                   f"   ·   CPU {sum(q['cpu'] for q in qs) * k:.1f}%")
 
     def toast(self, msg, error=False):
         self.page.show_dialog(ft.SnackBar(ft.Text(msg, color=TEXT), bgcolor="#3A1F25" if error else "#1F2A24",
@@ -1002,7 +1110,13 @@ class ResMon:
         sel_pids = {q["pid"] for q in self.selected_procs()}
         self.table_info.value = f"{min(len(qs), len(self.rows))} of {len(qs)} shown"
         pdh = self.tot["pdh_ok"] if self.tot else False
+        k = self.cpu_scale()
+        cpu_head = ("CPU/core" if self.per_core else "CPU") + (
+            (" ↓" if self.sort_desc else " ↑") if self.sort_key == "cpu" else "")
         dirty = [self.table_info]
+        if self.head_cells[2].content.value != cpu_head:
+            self.head_cells[2].content.value = cpu_head
+            dirty.append(self.head_cells[2])
         for row, q in zip(self.rows, qs + [None] * len(self.rows)):
             if q is None:
                 if row.visible:
@@ -1010,9 +1124,11 @@ class ResMon:
                     dirty.append(row)
                 continue
             bg = "#243049" if q["pid"] in sel_pids else None
-            vals = (q["name"], str(q["pid"]), f"{q['cpu']:.1f}", fmt_bytes(q["ws"]), fmt_bytes(q["priv"]),
+            vals = (q["name"], str(q["pid"]), f"{q['cpu'] * k:.1f}", fmt_bytes(q["ws"]), fmt_bytes(q["priv"]),
                     fmt_bytes(q["gpu_mem"]) if q["gpu_mem"] else ("-" if pdh else "n/a"),
-                    f"{q['gpu']:.0f}%" if q["gpu"] >= 0.5 else "-", str(q["threads"]),
+                    f"{q['gpu']:.0f}%" if q["gpu"] >= 0.5 else "-",
+                    # coarse on purpose: a live I/O figure on every row made each tick resend most rows
+                    fmt_rate(float(f"{q['io']:.2g}")) if q["io"] >= 100 << 10 else "-", str(q["threads"]),
                     dt.datetime.fromtimestamp(q["create"]).strftime("%d %b %H:%M") if q["create"] else "",
                     q["cmd"])
             if vals != row.vals or bg != row.bgcolor or not row.visible:  # untouched rows are not sent
@@ -1079,12 +1195,15 @@ class ResMon:
 
     def start_drag(self, e):
         if self.mode == "tab" and not self.busy:
+            self.busy = True  # a pan and a long press can both fire: one drag only
             self.page.run_task(self.drag)
 
     async def drag(self):
         """The tab follows the cursor while the button is held, then docks on the right edge of the monitor
         it was dropped on, at that height. The spot is saved for the next start."""
         self.busy = self.busy_drag = True
+        self.tab_view.mouse_cursor = ft.MouseCursor.MOVE  # held: now it is a handle
+        self.page.update(self.tab_view)
         try:
             while _u32.GetAsyncKeyState(0x01) & 0x8000:  # VK_LBUTTON
                 x, y = cursor_pos()
@@ -1099,6 +1218,7 @@ class ResMon:
                 save_anchor(self.anchor)
             except OSError as ex:
                 self.toast(f"Cannot save the tab position: {ex}", True)
+            self.tab_view.mouse_cursor = ft.MouseCursor.CLICK
             self.set_bounds(self.geometry("tab"))
         finally:
             self.busy = self.busy_drag = False
@@ -1246,19 +1366,19 @@ class ResMon:
         while True:
             t0 = time.perf_counter()
             if self.mode == "full" and not self.busy:
-                field, zoom, W, H = METRICS[self.metric][1], self.zoom, self.tm_w, self.tm_h
+                field, zoom, W, H, whole = self.metric, self.zoom, self.tm_w, self.tm_h, self.whole()
 
                 def work():  # sampling + layout off the event loop
                     procs = self.sampler.sample_procs()
                     names = {q["name"] for q in procs}
                     z = zoom if zoom in names else None
-                    return procs, (treemap_model(procs, field, z, W, H, self.sticky) if W else [])
+                    return procs, (treemap_model(procs, field, z, W, H, self.sticky, whole) if W else [])
 
                 procs, m = await asyncio.to_thread(work)
                 if self.mode == "full" and not self.busy:
                     a = time.perf_counter()
                     self.set_procs(procs)
-                    if (field, zoom) != (METRICS[self.metric][1], self.zoom):  # user changed it meanwhile
+                    if (field, zoom, bool(whole)) != (self.metric, self.zoom, bool(self.whole())):  # changed meanwhile
                         m = self.layout()
                     # hysteresis in time: tiles reflow at most every REFLOW s, labels update every tick
                     reflow = time.monotonic() - self.last_reflow >= REFLOW and self.geometry_changed(m)

@@ -14,14 +14,19 @@ and opens only when you reach for it.
 
 | State | How you get there | What you see |
 |---|---|---|
-| **Tab** | always there | A slim tab docked on the right edge, always on top, no taskbar button. Three live bars: CPU, RAM, GPU. |
-| **Panel** | hover the tab | Slides in from the edge: CPU per core, memory, commit, GPU (load, temperature, power), VRAM, disk and network, each with a 60 s sparkline. Folds back when the mouse leaves. |
+| **Tab** | always there | A slim tab docked on the right edge, always on top, no taskbar button. Three live bars: CPU, RAM, GPU. Press and hold to drag it to another height or monitor. |
+| **Panel** | rest on the tab | Slides in from the edge: CPU per core, memory, commit, GPU (load, temperature, power), VRAM, disk and network, each with a 60 s sparkline, plus free space per drive. Folds back when the mouse leaves. |
 | **Full view** | click the tab or the panel | A squarified treemap of all processes plus a sortable, searchable table. `Esc`, `-` or `x` docks it back to the tab. |
 
 ## What you can do in the full view
 
-- **Size the treemap by** RAM, private bytes, CPU, VRAM or GPU load. Colour by app or by CPU heat.
-- **Hover** a tile for PID, parent, RAM, CPU, VRAM, GPU and threads. **Double-click** an app to see its processes.
+- **Click a card** (CPU, MEMORY, GPU, VRAM, DISK) to size the treemap by it. Click MEMORY again to switch
+  between working set and private bytes. DISK sizes by per-process I/O (read + write bytes/s, all file I/O).
+- **Share of total:** tiles are sized against the whole machine (RAM, commit, CPU, GPU load, VRAM), with
+  **Other** (used, but not by the processes shown) and **Free** / **Idle** as their own tiles.
+- **Per core:** CPU % where 100% is one full core, like `top`, instead of 100% = the whole machine.
+- **Colour** by app or by CPU heat.
+- **Hover** a tile for PID, parent, RAM, CPU, VRAM, GPU, disk I/O and threads. **Double-click** an app to see its processes.
 - **Act on the selection:** copy PID, copy command line, open file location, set priority, end task (optionally the whole process tree).
 
 ## Install
