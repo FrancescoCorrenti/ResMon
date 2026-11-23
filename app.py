@@ -119,9 +119,7 @@ def place(b, clip=None):
     if not h:
         return
     _u32.SetWindowPos(h, 0, *(round(v) for v in b), 0x0014)  # NOZORDER|NOACTIVATE
-    rgn = _gdi.CreateRectRgn(*(round(v) for v in (clip[0], clip[1], clip[0] + clip[2], clip[1] + clip[3]))) \
-        if clip else None
-    _u32.SetWindowRgn(h, rgn, True)  # the system owns rgn from here on
+    # no SetWindowRgn for clip: a window region breaks Flutter's transparent window (it paints white)
 
 
 def move_to(x, y):
