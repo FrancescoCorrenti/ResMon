@@ -84,7 +84,9 @@ pub struct RawProc {
     pub private: u64,
     pub cpu_100ns: i64,
     pub create: i64, // unix seconds, 0 if unknown
-    pub io: u64,     // read + write transfer bytes: all file I/O, like Task Manager's I/O columns
+    pub io_r: u64,   // read / write transfer bytes: all file I/O, like Task Manager's I/O columns
+    pub io_w: u64,
+    pub thr: Vec<(u32, i64)>, // (thread id, kernel + user 100 ns), only when asked for
 }
 
 /// Query a system information class into `words` u64s (u64 for alignment), growing the buffer while the
@@ -108,7 +110,30 @@ fn nt_query(class: i32, words: usize) -> Vec<u64> {
     }
 }
 
-pub fn nt_processes() -> Vec<RawProc> {
+/// The SYSTEM_THREAD_INFORMATION records that follow a process record (x64: 0x50 bytes each; kernel time
+/// at 0, user time at 8, thread id in CLIENT_ID at 48).
+fn thread_times(proc_rec: *const u8, n: u32) -> Vec<(u32, i64)> {
+    (0..n as usize)
+        .map(|i| unsafe {
+            let t = proc_rec.add(0x100 + i * 0x50);
+            let k = (t as *const i64).read_unaligned();
+            let u = (t.add(8) as *const i64).read_unaligned();
+            let tid = (t.add(48) as *const usize).read_unaligned() as u32;
+            (tid, k + u)
+        })
+        .collect()
+}
+
+/// Ideal processor of a thread (the logical CPU the scheduler prefers for it), group 0 only.
+fn ideal_cpu(tid: u32) -> Option<u16> {
+    use windows::Win32::System::Kernel::PROCESSOR_NUMBER;
+    let h = Handle(unsafe { OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, tid) }.ok()?);
+    let mut pn = PROCESSOR_NUMBER::default();
+    unsafe { GetThreadIdealProcessorEx(h.0, &mut pn) }.ok()?;
+    (pn.Group == 0).then_some(pn.Number as u16)
+}
+
+pub fn nt_processes(threads: bool) -> Vec<RawProc> {
     let buf = nt_query(5, 1 << 17);
     let mut out = Vec::with_capacity(512);
     if buf.is_empty() {
@@ -135,7 +160,9 @@ pub fn nt_processes() -> Vec<RawProc> {
                 private: e.pagefile_usage as u64,
                 cpu_100ns: e.user_time + e.kernel_time,
                 create: if e.create_time > 0 { (e.create_time - EPOCH_DIFF) / 10_000_000 } else { 0 },
-                io: (e.read_transfer_count + e.write_transfer_count) as u64,
+                io_r: e.read_transfer_count as u64,
+                io_w: e.write_transfer_count as u64,
+                thr: if threads { thread_times(unsafe { base.add(off) }, e.number_of_threads) } else { Vec::new() },
             });
         }
         if e.next_entry_offset == 0 {
@@ -157,6 +184,37 @@ fn core_times() -> Vec<(i64, i64)> {
             (kernel + user - idle, kernel + user)
         })
         .collect()
+}
+
+/// Physical cores of processor group 0: for each, its logical processors (threads, same order as the
+/// per-core loads) and its efficiency class (hybrid CPUs: higher = performance core).
+pub fn core_topology() -> Vec<(Vec<usize>, u8)> {
+    use windows::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationProcessorCore};
+    let mut len = 0u32;
+    let _ = unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut len) };
+    let mut buf: Vec<u64> = vec![0; len as usize / 8 + 1];
+    if unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, Some(buf.as_mut_ptr() as *mut _), &mut len) }.is_err() {
+        return Vec::new();
+    }
+    let b = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize) };
+    let mut out = Vec::new();
+    let mut off = 0;
+    // record: relationship u32, size u32, then PROCESSOR_RELATIONSHIP: flags u8, efficiency class u8,
+    // reserved [u8; 20], group count u16 (offset 30), GROUP_AFFINITY { mask u64 (32), group u16 (40) }
+    while off + 42 <= b.len() {
+        let size = u32::from_le_bytes(b[off + 4..off + 8].try_into().unwrap()) as usize;
+        let class = b[off + 9];
+        let mask = u64::from_le_bytes(b[off + 32..off + 40].try_into().unwrap());
+        let group = u16::from_le_bytes(b[off + 40..off + 42].try_into().unwrap());
+        if group == 0 {
+            out.push(((0..64).filter(|i| mask >> i & 1 == 1).collect(), class));
+        }
+        if size == 0 {
+            break;
+        }
+        off += size;
+    }
+    out
 }
 
 fn commit_bytes() -> (u64, u64) {
@@ -393,6 +451,7 @@ pub struct Totals {
     pub drives: Vec<(String, u64, u64)>,
     pub pdh_ok: bool,
     pub gpu_err: Option<String>,
+    pub net_err: Option<String>, // why per-process network is missing
 }
 
 #[derive(Clone, Default)]
@@ -404,7 +463,11 @@ pub struct Proc {
     pub ws: f64,
     pub private: f64,
     pub cpu: f64, // % of the whole machine
-    pub io: f64,  // bytes/s
+    pub io_r: f64, // bytes/s
+    pub io_w: f64,
+    pub net_d: f64, // bytes/s, from the Winsock trace (net.rs)
+    pub net_u: f64,
+    pub cpus: Vec<(u16, f32)>, // per-core view: (logical CPU, % of it), estimated from the threads' ideal processors
     pub create: i64,
     pub gpu_mem: f64,
     pub gpu: f64,
@@ -418,7 +481,16 @@ pub enum Field {
     Cpu,
     GpuMem,
     Gpu,
-    Io,
+    IoRead,
+    IoWrite,
+    NetDown,
+    NetUp,
+}
+
+impl Field {
+    pub fn is_rate(self) -> bool {
+        matches!(self, Field::IoRead | Field::IoWrite | Field::NetDown | Field::NetUp)
+    }
 }
 
 impl Proc {
@@ -429,7 +501,10 @@ impl Proc {
             Field::Cpu => self.cpu,
             Field::GpuMem => self.gpu_mem,
             Field::Gpu => self.gpu,
-            Field::Io => self.io,
+            Field::IoRead => self.io_r,
+            Field::IoWrite => self.io_w,
+            Field::NetDown => self.net_d,
+            Field::NetUp => self.net_u,
         }
     }
 }
@@ -460,8 +535,12 @@ pub struct Sampler {
     gpu_err: Option<String>,
     io: Option<Pdh>,  // disk + network rates, every tick
     gpu: Option<Pdh>, // per-process GPU, only with the process table
+    net_err: Option<String>,
+    net_on: bool,
+    pub split: bool, // per-core view open: also sample threads
+    prev_thr: HashMap<u32, (u32, i64)>,
     cores: Vec<(i64, i64)>,
-    prev: HashMap<(u32, i64), (i64, u64)>,
+    prev: HashMap<(u32, i64), [u64; 5]>, // cpu 100 ns, io read, io write, net sent, net received
     prev_t: Option<Instant>,
     cmd: HashMap<(u32, i64), String>,
     ticks: u64,
@@ -479,6 +558,10 @@ impl Sampler {
             ncpu: cores.len().max(1),
             nvml,
             gpu_err,
+            net_err: None,
+            net_on: false,
+            split: false,
+            prev_thr: HashMap::new(),
             io: Pdh::new(&[
                 r"\PhysicalDisk(_Total)\Disk Read Bytes/sec",
                 r"\PhysicalDisk(_Total)\Disk Write Bytes/sec",
@@ -543,6 +626,21 @@ impl Sampler {
             drives: self.drives.clone(),
             pdh_ok: self.gpu.is_some(),
             gpu_err: self.gpu_err.clone(),
+            net_err: self.net_err.clone(),
+        }
+    }
+
+    /// The network trace runs only while someone looks at processes (the full view): docked it would cost
+    /// CPU and buffers for numbers nobody sees.
+    pub fn set_net(&mut self, on: bool) {
+        if on == self.net_on {
+            return;
+        }
+        self.net_on = on;
+        if on {
+            self.net_err = crate::net::start().err();
+        } else {
+            crate::net::stop();
         }
     }
 
@@ -574,16 +672,37 @@ impl Sampler {
         let mut cur = HashMap::new();
         let mut live = HashSet::new();
         let ncpu = self.ncpu as f64;
-        let procs: Vec<Proc> = nt_processes()
+        let net = crate::net::totals().unwrap_or_default();
+        let prev_thr = std::mem::take(&mut self.prev_thr);
+        let mut cur_thr = HashMap::new();
+        let procs: Vec<Proc> = nt_processes(self.split)
             .into_iter()
             .map(|r| {
                 let key = (r.pid, r.create);
                 live.insert(key);
-                cur.insert(key, (r.cpu_100ns, r.io));
-                let (mut cpu, mut io) = (0.0, 0.0);
-                if let (Some(dt), Some(&(c0, i0))) = (dt, self.prev.get(&key)) {
-                    cpu = ((r.cpu_100ns - c0) as f64 / 1e7 / dt * 100.0 / ncpu).max(0.0);
-                    io = (r.io.saturating_sub(i0)) as f64 / dt;
+                let (ns, nr) = net.get(&r.pid).copied().unwrap_or_default();
+                let now = [r.cpu_100ns.max(0) as u64, r.io_r, r.io_w, ns, nr];
+                cur.insert(key, now);
+                let mut rate = [0.0f64; 5];
+                if let (Some(dt), Some(before)) = (dt, self.prev.get(&key)) {
+                    for i in 0..5 {
+                        rate[i] = now[i].saturating_sub(before[i]) as f64 / dt;
+                    }
+                }
+                let mut cpus: Vec<(u16, f32)> = Vec::new();
+                for &(tid, t) in &r.thr {
+                    cur_thr.insert(tid, (r.pid, t));
+                    if let (Some(dt), Some(&(pid0, t0))) = (dt, prev_thr.get(&tid))
+                        && pid0 == r.pid
+                        && t > t0
+                        && let Some(c) = ideal_cpu(tid)
+                    {
+                        let pct = ((t - t0) as f64 / 1e7 / dt * 100.0) as f32;
+                        match cpus.iter_mut().find(|e| e.0 == c) {
+                            Some(e) => e.1 += pct,
+                            None => cpus.push((c, pct)),
+                        }
+                    }
                 }
                 let cmd = self.cmd.entry(key).or_insert_with(|| cmdline(r.pid)).clone();
                 Proc {
@@ -592,8 +711,12 @@ impl Sampler {
                     threads: r.threads,
                     ws: r.ws as f64,
                     private: r.private as f64,
-                    cpu,
-                    io,
+                    cpu: rate[0] / 1e7 * 100.0 / ncpu,
+                    io_r: rate[1],
+                    io_w: rate[2],
+                    net_u: rate[3],
+                    net_d: rate[4],
+                    cpus,
                     create: r.create,
                     gpu_mem: gmem.get(&r.pid).copied().unwrap_or(0.0),
                     gpu: gutil.get(&r.pid).copied().unwrap_or(0.0),
@@ -603,6 +726,7 @@ impl Sampler {
             })
             .collect();
         self.prev = cur;
+        self.prev_thr = cur_thr;
         self.cmd.retain(|k, _| live.contains(k));
         procs
     }
@@ -726,13 +850,24 @@ mod tests {
     #[test]
     fn process_table_sees_us() {
         let me = std::process::id();
-        let ps = nt_processes();
+        let ps = nt_processes(true);
+        assert!(ps.iter().find(|p| p.pid == me).unwrap().thr.len() >= 1);
+        assert_eq!(std::mem::size_of::<Spi>(), 0x100);
         let p = ps.iter().find(|p| p.pid == me).expect("own pid");
         assert!(p.name.to_lowercase().starts_with("resmon"), "{}", p.name);
         assert!(p.ws > 1 << 20 && p.threads >= 1);
         assert!(p.create > 1_600_000_000);
         assert!(ps.len() > 20);
         assert!(cmdline(me).to_lowercase().contains("resmon"));
+    }
+
+    #[test]
+    fn every_thread_belongs_to_one_core() {
+        let cores = core_topology();
+        let mut all: Vec<usize> = cores.iter().flat_map(|c| c.0.clone()).collect();
+        all.sort();
+        let n = unsafe { windows::Win32::System::Threading::GetActiveProcessorCount(0) } as usize;
+        assert_eq!(all, (0..n).collect::<Vec<_>>(), "{cores:?}");
     }
 
     #[test]

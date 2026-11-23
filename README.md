@@ -21,11 +21,18 @@ memory and well under 1% of one CPU core.
 
 ## What you can do in the full view
 
-- **Click a card** (CPU, MEMORY, GPU, VRAM, DISK) to size the treemap by it. Click MEMORY again to switch
-  between working set and private bytes. DISK sizes by per-process I/O (read + write bytes/s, all file I/O).
-- **Share of total:** tiles are sized against the whole machine (RAM, commit, CPU, GPU load, VRAM), with
-  **Other** (used, but not by the processes shown) and **Free** / **Idle** as their own tiles.
-- **Per core:** CPU % where 100% is one full core, like `top`, instead of 100% = the whole machine.
+- **Click a card** (CPU, MEMORY, GPU, VRAM) to size the treemap by it. Click MEMORY again to switch
+  between working set and private bytes.
+- **DISK and NETWORK** split the map in two: who reads | who writes (all file I/O, per process), who
+  downloads | who uploads.
+- **DRIVES:** click a drive to see what fills it, folder by folder. The scan runs in the background at low
+  I/O priority; folders appear and grow as it goes, the unscanned part shrinks. Double-click a folder to
+  open it, the path above takes you back.
+- **Share of total:** tiles are sized against the whole machine (RAM, commit, CPU, GPU load, VRAM, drive),
+  with **Other** (used, but not by the processes shown) and **Free** / **Idle** as their own tiles.
+- **Per core** (with CPU): every physical core with its threads (logical processors), each filled by its
+  load and split into the processes that ran there. Loads and per-process totals are measured; where each
+  process ran is an estimate (see below).
 - **Colour** by app or by CPU heat.
 - **Hover** a tile for PID, parent, user, RAM, CPU, VRAM, GPU, disk I/O and threads. **Double-click** an app
   to see its processes.
@@ -58,6 +65,14 @@ full view (it adds ResMon to your user's `Run` registry key). **Quit** is in the
   And frames only happen when something changed: a new sample, the mouse, an animation.
 - **Processes:** one `NtQuerySystemInformation` call per tick for every process (about 15 ms), instead of
   opening processes one by one.
+- **Per-process network, no administrator:** Windows keeps no per-process network counter, and the kernel
+  network trace needs elevation. The Winsock trace provider does not (for members of "Performance Log
+  Users", which an administrator account is by default): ResMon runs a real-time ETW session on it while
+  the full view is open and adds up each process's sends and receives (`src/net.rs`; a test checks a
+  loopback transfer, an ignored one a 10 MB download). Loopback traffic is included.
+- **Per core:** Windows records which CPU ran a thread only in a kernel trace (administrator). ResMon starts
+  from each busy thread's ideal processor and balances the table so that every process sums to its measured
+  CPU time and every thread of the CPU to its measured load.
 - **Per-process GPU:** Windows PDH counters `GPU Engine` and `GPU Process Memory`, read by their English names
   so it also works on localized Windows. NVML adds GPU temperature and power on NVIDIA cards; without one
   ResMon still runs, just without those two values.

@@ -74,6 +74,48 @@ struct Runner {
     last: Instant,
     log: bool,  // RESMON_LOG: per-frame timings in %TEMP%/resmon.log
     dump: bool, // RESMON_DUMP: every frame as raw BGRA in %TEMP%
+    script: Vec<(Instant, Step)>,
+    shots: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Step {
+    Move(f32, f32),
+    Button(f32, f32, bool),
+    Shot,
+}
+
+/// RESMON_SCRIPT="2:click:1580,232; 3.5:dbl:900,500; 4:move:10,10; 5:shot" (seconds from start, window px).
+/// A shot writes the frame to %TEMP%\resmon_shotN_WxH.bgra.
+fn parse_script(s: &str) -> Vec<(Instant, Step)> {
+    let t0 = Instant::now();
+    let mut out = Vec::new();
+    for item in s.split(';').map(str::trim).filter(|i| !i.is_empty()) {
+        let mut parts = item.split(':');
+        let (Some(t), Some(kind)) = (parts.next().and_then(|t| t.parse::<f64>().ok()), parts.next()) else { continue };
+        let at = t0 + Duration::from_secs_f64(t);
+        let xy: Vec<f32> = parts.next().unwrap_or("").split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        let (x, y) = (xy.first().copied().unwrap_or(0.0), xy.get(1).copied().unwrap_or(0.0));
+        let click = |at: Instant, out: &mut Vec<(Instant, Step)>| {
+            out.push((at, Step::Button(x, y, true)));
+            out.push((at + Duration::from_millis(40), Step::Button(x, y, false)));
+        };
+        match kind {
+            "click" => {
+                out.push((at, Step::Move(x, y))); // hover first, like a real pointer
+                click(at + Duration::from_millis(100), &mut out);
+            }
+            "dbl" => {
+                click(at, &mut out);
+                click(at + Duration::from_millis(120), &mut out);
+            }
+            "move" => out.push((at, Step::Move(x, y))),
+            "shot" => out.push((at, Step::Shot)),
+            _ => {}
+        }
+    }
+    out.sort_by_key(|e| e.0);
+    out
 }
 
 impl Runner {
@@ -84,6 +126,28 @@ impl Runner {
     fn frame(&mut self, el: &ActiveEventLoop) {
         let (Some(window), Some(state), Some(app)) = (self.window.clone(), self.state.as_mut(), self.app.as_mut()) else { return };
         self.last = Instant::now();
+        // scripted input (RESMON_SCRIPT): synthetic pointer events, for checks that must not move the real mouse
+        let mut shot = false;
+        while let Some((at, step)) = self.script.first().cloned()
+            && at <= self.last
+        {
+            self.script.remove(0);
+            let ppp = window.scale_factor() as f32;
+            let input = state.egui_input_mut();
+            let pos = |x: f32, y: f32| egui::pos2(x / ppp, y / ppp);
+            match step {
+                Step::Move(x, y) => input.events.push(egui::Event::PointerMoved(pos(x, y))),
+                Step::Button(x, y, pressed) => {
+                    input.events.push(egui::Event::PointerMoved(pos(x, y)));
+                    input.events.push(egui::Event::PointerButton { pos: pos(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+                }
+                Step::Shot => shot = true,
+            }
+        }
+        if let Some((at, _)) = self.script.first() {
+            let at = *at;
+            self.next = Some(self.next.map_or(at, |n| n.min(at)));
+        }
         let input = state.take_egui_input(&window);
         let out = self.ctx.run_ui(input, |ui| {
             app.logic(ui.ctx());
@@ -125,9 +189,15 @@ impl Runner {
         let mut d = out.textures_delta;
         d.clear();
         let t_raster = Instant::now();
-        if self.dump {
+        if self.dump || shot {
             let bytes: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
-            let _ = std::fs::write(std::env::temp_dir().join(format!("resmon_{w}x{h}.bgra")), bytes);
+            let name = if shot {
+                self.shots += 1;
+                format!("resmon_shot{}_{w}x{h}.bgra", self.shots)
+            } else {
+                format!("resmon_{w}x{h}.bgra")
+            };
+            let _ = std::fs::write(std::env::temp_dir().join(name), bytes);
         }
         let ulw = unsafe {
             // winit rewrites the extended style when it shows or moves the window, dropping WS_EX_LAYERED
@@ -265,6 +335,8 @@ pub fn run() {
         last: Instant::now() - MIN_FRAME,
         log: std::env::var_os("RESMON_LOG").is_some(),
         dump: std::env::var_os("RESMON_DUMP").is_some(),
+        script: parse_script(&std::env::var("RESMON_SCRIPT").unwrap_or_default()),
+        shots: 0,
     };
     let _ = el.run_app(&mut r);
 }

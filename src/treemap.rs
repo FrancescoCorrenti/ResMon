@@ -10,13 +10,16 @@ pub const HEADER: f32 = 18.0; // px of the app-name band on a group tile
 pub enum Key {
     Group(String),
     Pid(u32),
-    Part(&'static str), // "Other" / "Free" / "Idle"
+    Part(&'static str), // "Other" / "Free" / "Idle" / "Files" / "Not scanned yet"
+    Dir(u32),           // a folder of the disk space map
+    Side(u8, Box<Key>), // a tile of the left (0) or right (1) half of a split view
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Hit {
     Pid(u32),
     Group(String),
+    Dir(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +207,65 @@ pub fn model(procs: &[Proc], field: Field, zoom: Option<&str>, w: f32, h: f32, s
             let hd = HEADER as f64;
             for (q, cr) in squarify(&inner, r[0] + 2.0, r[1] + hd + 1.0, r[2] - 4.0, r[3] - hd - 3.0) {
                 leaf(q, cr, format!("PID {}", q.pid), &mut tiles);
+            }
+        }
+    }
+    tiles
+}
+
+/// A tile to lay out, with optional children drawn inside it (the disk space map: folders and their
+/// subfolders).
+pub struct Item {
+    pub key: Key,
+    pub hit: Option<Hit>,
+    pub title: String,
+    pub value: f64,
+    pub free: bool,
+    pub children: Vec<Item>,
+}
+
+/// Two-level layout: every item gets its share of the box; an item with children becomes a frame with a
+/// header band and its children inside, when it is big enough. Same hysteresis as the process map.
+pub fn nested(items: Vec<Item>, w: f32, h: f32, sticky: &mut Sticky) -> Vec<Tile> {
+    let mut vals = HashMap::new();
+    for it in &items {
+        vals.insert(it.key.clone(), it.value);
+        for c in &it.children {
+            vals.insert(c.key.clone(), c.value);
+        }
+    }
+    sticky.update(vals);
+    let sv = |k: &Key| sticky.values[k];
+    let order = |v: &mut Vec<&Item>| v.sort_by(|a, b| sv(&b.key).total_cmp(&sv(&a.key)).then(a.title.cmp(&b.title)));
+    let mut top: Vec<&Item> = items.iter().filter(|i| i.value > 0.0).collect();
+    order(&mut top);
+    // free / not-scanned parts last, so they fill the corner
+    top.sort_by_key(|i| i.free);
+    let tile = |it: &Item, r: [f64; 4], header: bool| Tile {
+        key: it.key.clone(),
+        hit: it.hit.clone(),
+        rect: shrink(r, 1.0),
+        title: it.title.clone(),
+        value: it.value,
+        name: it.title.clone(),
+        cpu: 0.0,
+        header,
+        free: it.free,
+    };
+    let mut tiles = Vec::new();
+    let list: Vec<(f64, &Item)> = top.iter().map(|i| (sv(&i.key), *i)).collect();
+    for (it, r) in squarify(&list, 0.0, 0.0, w as f64, h as f64) {
+        let mut kids: Vec<&Item> = it.children.iter().filter(|c| c.value > 0.0).collect();
+        let framed = kids.len() > 1 && r[2] >= 30.0 && r[3] >= 40.0;
+        tiles.push(tile(it, r, framed));
+        if framed {
+            order(&mut kids);
+            let inner: Vec<(f64, &Item)> = kids.iter().map(|c| (sv(&c.key), *c)).collect();
+            let hd = HEADER as f64;
+            for (c, cr) in squarify(&inner, r[0] + 2.0, r[1] + hd + 1.0, r[2] - 4.0, r[3] - hd - 3.0) {
+                if cr[2] >= 7.0 && cr[3] >= 7.0 {
+                    tiles.push(tile(c, cr, false));
+                }
             }
         }
     }

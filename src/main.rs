@@ -6,8 +6,10 @@
 //! repaints only when one of them asks, or while something is moving.
 #![windows_subsystem = "windows"]
 
+mod net;
 mod raster;
 mod shell;
+mod space;
 mod sys;
 mod treemap;
 
@@ -24,13 +26,15 @@ use treemap::{Hit, Key, Sticky, Tile};
 use windows::Win32::Foundation::HWND;
 
 const REFLOW: f64 = 8.0; // seconds between two treemap reflows
-const TAB: Vec2 = vec2(26.0, 168.0); // docked tab (logical px)
+const TAB: Vec2 = vec2(34.0, 178.0); // docked tab (logical px): three bars with their icons
 const PANEL: Vec2 = vec2(264.0, 790.0); // hover panel
 const FULL: Vec2 = vec2(1440.0, 900.0); // full view (clamped to the work area)
-const HOVER_OPEN: f32 = 2.0; // seconds resting on the tab before the panel opens (time to grab and drag it)
+const HOVER_OPEN: f32 = 0.6; // seconds resting on the tab before the panel opens (dragging starts on a press, not on rest)
 const UI_ANIM: f64 = 0.28; // shell transitions
 const FADE: f64 = 0.22; // full view content fade
 const TILE_ANIM: f64 = 0.55; // treemap tiles glide
+const SPLIT_GAP: f32 = 10.0; // split view (disk read | write, network down | up): space between halves
+const SPLIT_CAPTION: f32 = 28.0; // and the caption band over each half
 
 // monochrome shell; colour is kept for data only (sparklines, bars, tiles)
 const BG: Color32 = Color32::from_rgb(0x0B, 0x0D, 0x11);
@@ -52,6 +56,19 @@ const C_DISK2: Color32 = Color32::from_rgb(0xF2, 0xC7, 0xB6);
 const C_NET: Color32 = Color32::from_rgb(0x62, 0xC6, 0xD4);
 const C_NET2: Color32 = Color32::from_rgb(0xB6, 0xE6, 0xEC);
 const DANGER: Color32 = Color32::from_rgb(0xF0, 0x62, 0x72);
+// Segoe Fluent Icons glyphs
+const I_CPU: &str = "\u{EEA1}";
+const I_RAM: &str = "\u{EEA0}";
+const I_COMMIT: &str = "\u{EEA3}";
+const I_GPU: &str = "\u{E7F4}";
+const I_VRAM: &str = "\u{E964}";
+const I_DISK: &str = "\u{EDA2}";
+const I_NET: &str = "\u{E774}";
+const I_DRIVES: &str = "\u{E8B7}";
+const I_READ: &str = "\u{E7B3}"; // eye
+const I_WRITE: &str = "\u{E70F}"; // pencil
+const I_DOWN: &str = "\u{E896}";
+const I_UP: &str = "\u{E898}";
 const PALETTE: [u32; 12] = [0x3D7FD9, 0x8C5BD6, 0xD6508F, 0xD99A2B, 0x2FA57A, 0x2AA6BF, 0xD9573D, 0x7DAA2F, 0x5B63D6, 0x2F9C94, 0xC2732E, 0xA24FC9];
 
 // ------------------------------------------------------------------ formatting / colour
@@ -196,6 +213,7 @@ struct Shared {
     procs_seq: u64,
     want_procs: bool,
     procs_now: bool,
+    want_split: bool, // per-core view open: sample threads too
     // hover watcher
     mode: Mode,
     bounds: (i32, i32, i32, i32),
@@ -222,8 +240,10 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
             }
             let (want, asap) = {
                 let mut g = s1.lock().unwrap();
+                s.split = g.want_split;
                 (g.want_procs, std::mem::take(&mut g.procs_now))
             };
+            s.set_net(want);
             if want && (asap || last_procs.is_none_or(|t| now - t >= Duration::from_millis(1500))) {
                 let p = Arc::new(s.sample_procs());
                 last_procs = Some(now);
@@ -248,8 +268,8 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
                 let g = sh.lock().unwrap();
                 (g.mode, g.bounds, g.busy || g.hover_fire)
             };
-            if busy || mode == Mode::Full {
-                since = None;
+            if busy || mode == Mode::Full || sys::left_button_down() {
+                since = None; // a held button is a drag in the making, not a hover
                 continue;
             }
             let (x, y) = sys::cursor_pos();
@@ -281,25 +301,39 @@ enum Col {
     Private,
     GpuMem,
     Gpu,
-    Io,
+    IoR,
+    IoW,
+    NetD,
+    NetU,
     Threads,
     Create,
     Cmd,
 }
 
-const COLS: [(Col, &str, f32, bool); 11] = [
-    (Col::Name, "Name", 210.0, false),
-    (Col::Pid, "PID", 70.0, true),
-    (Col::Cpu, "CPU", 64.0, true),
-    (Col::Ws, "RAM", 82.0, true),
-    (Col::Private, "Private", 82.0, true),
-    (Col::GpuMem, "VRAM", 82.0, true),
-    (Col::Gpu, "GPU", 60.0, true),
-    (Col::Io, "Disk I/O", 90.0, true),
-    (Col::Threads, "Threads", 64.0, true),
-    (Col::Create, "Started", 110.0, true),
+const COLS: [(Col, &str, f32, bool); 14] = [
+    (Col::Name, "Name", 190.0, false),
+    (Col::Pid, "PID", 62.0, true),
+    (Col::Cpu, "CPU", 62.0, true),
+    (Col::Ws, "RAM", 76.0, true),
+    (Col::Private, "Private", 76.0, true),
+    (Col::GpuMem, "VRAM", 76.0, true),
+    (Col::Gpu, "GPU", 52.0, true),
+    (Col::IoR, "Disk read", 80.0, true),
+    (Col::IoW, "Disk write", 80.0, true),
+    (Col::NetD, "Download", 80.0, true),
+    (Col::NetU, "Upload", 80.0, true),
+    (Col::Threads, "Threads", 60.0, true),
+    (Col::Create, "Started", 100.0, true),
     (Col::Cmd, "Command line", 0.0, false),
 ];
+
+/// The disk space map: a background scan of one drive, viewed one folder at a time.
+struct SpaceView {
+    scan: space::Scan,
+    at: u32,      // folder shown
+    used: u64,    // the drive's used and total bytes, for "Not scanned yet" and "Free"
+    total: u64,
+}
 
 struct Trans {
     to: Mode,
@@ -344,12 +378,16 @@ struct App {
     anim: HashMap<Key, ([f32; 4], [f32; 4])>,
     anim_t0: f64,
     sticky: Sticky,
+    sticky2: Sticky, // the right half of a split view (writes, upload)
     last_reflow: f64,
     tm_size: Vec2,
     // table
     sort: (Col, bool),
     query: String,
     rows: Vec<usize>,
+    space: Option<SpaceView>, // Some: the treemap and table show disk space instead of processes
+    cores: Vec<(Vec<usize>, u8)>, // physical cores: their threads (logical processors) and efficiency class
+    space_seen: u64,          // folders count at the last space layout, to relayout as the scan grows
     // misc
     toast: Option<(String, bool, f64)>,
     kill_ask: Option<KillAsk>,
@@ -373,6 +411,7 @@ impl App {
             procs_seq: 0,
             want_procs: false,
             procs_now: false,
+            want_split: false,
             mode: Mode::Tab,
             bounds: (0, 0, 0, 0),
             busy: true,
@@ -407,11 +446,15 @@ impl App {
             anim: HashMap::new(),
             anim_t0: 0.0,
             sticky: Sticky::new(0.15),
+            sticky2: Sticky::new(0.15),
             last_reflow: -1e9,
             tm_size: Vec2::ZERO,
             sort: (Col::Ws, true),
             query: String::new(),
             rows: Vec::new(),
+            space: None,
+            cores: sys::core_topology(),
+            space_seen: 0,
             toast: None,
             kill_ask: None,
             startup: sys::startup_enabled(),
@@ -487,6 +530,7 @@ impl App {
             let b = self.geometry(Mode::Tab);
             self.set_bounds(b, now);
             self.sh.lock().unwrap().want_procs = false;
+            self.space = None; // the folder tree can be tens of MB: docked, give it back
         }
         self.trans = None;
     }
@@ -518,6 +562,7 @@ impl App {
         g.mode = self.mode;
         g.bounds = self.bounds;
         g.busy = self.trans.is_some() || self.drag || !self.shown;
+        g.want_split = self.mode == Mode::Full && self.per_core && self.metric == Field::Cpu && self.space.is_none();
     }
 
     // -------------------------------------------------------------- processes / treemap model
@@ -535,10 +580,13 @@ impl App {
         let gone = match &self.sel {
             Some(Hit::Pid(p)) => !self.by_pid.contains_key(p),
             Some(Hit::Group(n)) => !self.groups.contains_key(n),
-            None => false,
+            Some(Hit::Dir(_)) | None => false,
         };
         if gone {
             self.sel = None;
+        }
+        if self.space.is_some() {
+            return; // the process list is kept fresh for the cards; the map shows the disk
         }
         let m = self.layout();
         let reflow = now - self.last_reflow >= REFLOW && self.geometry_changed(&m);
@@ -550,8 +598,112 @@ impl App {
         if self.tm_size.x < 1.0 {
             return Vec::new();
         }
+        if self.space.is_some() {
+            return self.space_layout();
+        }
+        if let Some((a, b)) = self.split_fields() {
+            // two maps side by side, each under a caption band
+            let (w, h) = ((self.tm_size.x - SPLIT_GAP) / 2.0, self.tm_size.y - SPLIT_CAPTION);
+            let zoom = self.zoom.clone();
+            let mut tiles = Vec::new();
+            for (side, f) in [(0u8, a), (1u8, b)] {
+                let st = if side == 0 { &mut self.sticky } else { &mut self.sticky2 };
+                for mut t in treemap::model(&self.procs, f, zoom.as_deref(), w, h, st, None) {
+                    t.rect[0] += side as f32 * (w + SPLIT_GAP);
+                    t.rect[1] += SPLIT_CAPTION;
+                    t.key = Key::Side(side, Box::new(t.key));
+                    tiles.push(t);
+                }
+            }
+            return tiles;
+        }
         let whole = self.whole();
         treemap::model(&self.procs, self.metric, self.zoom.as_deref(), self.tm_size.x, self.tm_size.y, &mut self.sticky, whole)
+    }
+
+    // -------------------------------------------------------------- disk space map
+
+    /// Folders of the current one (each with its own subfolders inside), plus "Files" (directly in it) and,
+    /// at the drive root, "Not scanned yet" (used space the scan has not reached) and, with Share of total,
+    /// "Free". As the scan advances the scanned folders grow and the unscanned part shrinks.
+    fn space_layout(&mut self) -> Vec<Tile> {
+        let Some(sv) = &self.space else { return Vec::new() };
+        let g = sv.scan.tree.lock().unwrap();
+        let node = &g.nodes[sv.at as usize];
+        let files_key = |id: u32| Key::Dir(id | 0x8000_0000); // "Files" of a folder: its own tile key
+        let kid = |c: u32| {
+            let n = &g.nodes[c as usize];
+            let mut children: Vec<treemap::Item> = n
+                .children
+                .iter()
+                .map(|&cc| treemap::Item { key: Key::Dir(cc), hit: Some(Hit::Dir(cc)), title: g.nodes[cc as usize].name.to_string(), value: g.nodes[cc as usize].total as f64, free: false, children: Vec::new() })
+                .collect();
+            if n.files > 0 && !children.is_empty() {
+                children.push(treemap::Item { key: files_key(c), hit: Some(Hit::Dir(c)), title: "Files".into(), value: n.files as f64, free: true, children: Vec::new() });
+            }
+            treemap::Item { key: Key::Dir(c), hit: Some(Hit::Dir(c)), title: n.name.to_string(), value: n.total as f64, free: false, children }
+        };
+        let mut items: Vec<treemap::Item> = node.children.iter().map(|&c| kid(c)).collect();
+        if node.files > 0 {
+            items.push(treemap::Item { key: files_key(sv.at), hit: None, title: "Files".into(), value: node.files as f64, free: true, children: Vec::new() });
+        }
+        if sv.at == 0 {
+            let missing = sv.used.saturating_sub(g.nodes[0].total);
+            if !g.done && missing > 0 {
+                items.push(treemap::Item { key: Key::Part("Not scanned yet"), hit: None, title: "Not scanned yet".into(), value: missing as f64, free: true, children: Vec::new() });
+            }
+            if self.relative {
+                items.push(treemap::Item { key: Key::Part("Free"), hit: None, title: "Free".into(), value: sv.total.saturating_sub(sv.used) as f64, free: true, children: Vec::new() });
+            }
+        }
+        drop(g);
+        treemap::nested(items, self.tm_size.x, self.tm_size.y, &mut self.sticky)
+    }
+
+    /// Open the disk space map of `drive` ("C:"), starting its scan if needed.
+    fn open_space(&mut self, drive: &str, now: f64, ctx: &egui::Context) {
+        let (used, total) = self.tot.as_ref().and_then(|t| t.drives.iter().find(|d| d.0 == drive).map(|d| (d.1, d.2))).unwrap_or((0, 0));
+        if self.space.as_ref().is_none_or(|s| s.scan.root != drive) {
+            let c = ctx.clone();
+            self.space = Some(SpaceView { scan: space::Scan::start(drive, move || c.request_repaint()), at: 0, used, total });
+        } else if let Some(s) = &mut self.space {
+            s.at = 0;
+        }
+        (self.sel, self.zoom, self.space_seen) = (None, None, 0);
+        self.relayout(now);
+    }
+
+    fn space_enter(&mut self, id: u32, now: f64) {
+        if let Some(s) = &mut self.space {
+            let has_kids = !s.scan.tree.lock().unwrap().nodes[id as usize].children.is_empty();
+            if has_kids {
+                s.at = id;
+                self.sel = None;
+                self.relayout(now);
+            }
+        }
+    }
+
+    /// The scan moved on: lay the map out again (with a glide), at most once a second.
+    fn space_tick(&mut self, now: f64) {
+        let Some(s) = &self.space else { return };
+        let n = s.scan.tree.lock().unwrap().folders as u64;
+        let n = n * 2 + s.scan.tree.lock().unwrap().done as u64; // the end of the scan also changes the map
+        if n != self.space_seen && now - self.last_reflow >= 1.0 {
+            self.space_seen = n;
+            let m = self.layout();
+            self.apply(m, true, now);
+            self.refresh_rows();
+        }
+    }
+
+    /// Disk and network are shown as one split view: (left, right) measures.
+    fn split_fields(&self) -> Option<(Field, Field)> {
+        match self.metric {
+            Field::IoRead | Field::IoWrite => Some((Field::IoRead, Field::IoWrite)),
+            Field::NetDown | Field::NetUp => Some((Field::NetDown, Field::NetUp)),
+            _ => None,
+        }
     }
 
     /// (total, used, free label) of the machine in the metric's units, for "Share of total"; None when off or
@@ -565,7 +717,8 @@ impl App {
             Field::Cpu => Some((100.0, s.cpu as f64, "Idle")), // processes are in % of the machine whatever the display
             Field::Gpu => g.util.map(|u| (100.0, u as f64, "Idle")),
             Field::GpuMem => (g.mem_total > 0).then(|| (g.mem_total as f64, g.mem_used as f64, "Free")),
-            Field::Io => None,
+            // rates have no fixed maximum (and process file I/O counts cache hits the disk never sees)
+            Field::IoRead | Field::IoWrite | Field::NetDown | Field::NetUp => None,
         }
     }
 
@@ -589,13 +742,18 @@ impl App {
             // nothing moves (first layout, same geometry): no glide, so no 0.5 s of frames for nothing
             (self.anim_t0, self.last_reflow) = (if moves { now } else { -1e9 }, now);
         } else {
-            let old: HashMap<&Key, &Tile> = self.tiles.iter().map(|t| (&t.key, t)).collect();
-            m = m
-                .into_iter()
-                .filter_map(|mut t| {
-                    let o = old.get(&t.key)?;
-                    (t.rect, t.header) = (o.rect, o.header);
-                    Some(t)
+            // same geometry, fresh labels; a tile whose process dropped out of the measure keeps its place
+            // until the next reflow (dropping it left a dark hole in the map)
+            let mut new: HashMap<Key, Tile> = m.into_iter().map(|t| (t.key.clone(), t)).collect();
+            m = self
+                .tiles
+                .iter()
+                .map(|o| match new.remove(&o.key) {
+                    Some(mut t) => {
+                        (t.rect, t.header) = (o.rect, o.header);
+                        t
+                    }
+                    None => Tile { value: 0.0, cpu: 0.0, ..o.clone() }, // says what it uses now: nothing
                 })
                 .collect();
         }
@@ -609,21 +767,24 @@ impl App {
 
     /// User changed metric / zoom / share: new layout now, tiles glide to it.
     fn relayout(&mut self, now: f64) {
-        self.sticky = Sticky::new(0.15);
+        (self.sticky, self.sticky2) = (Sticky::new(0.15), Sticky::new(0.15));
         let m = self.layout();
         self.apply(m, true, now);
         self.refresh_rows();
     }
 
     fn cpu_scale(&self) -> f64 {
-        if self.per_core { self.tot.as_ref().map_or(1, |t| t.per_core.len()) as f64 } else { 1.0 }
+        1.0 // CPU % is always of the whole machine; "Per core" shows the cores themselves (draw_cores)
     }
 
     fn fmt_metric(&self, v: f64) -> String {
+        if self.space.is_some() {
+            return fmt_bytes(v);
+        }
         match self.metric {
             Field::Cpu => format!("{:.1}%", v * self.cpu_scale()),
             Field::Gpu => format!("{v:.1}%"),
-            Field::Io => fmt_rate(v),
+            f if f.is_rate() => fmt_rate(v),
             _ => fmt_bytes(v),
         }
     }
@@ -635,13 +796,20 @@ impl App {
             Field::Cpu => "CPU",
             Field::GpuMem => "VRAM",
             Field::Gpu => "GPU load",
-            Field::Io => "disk I/O",
+            Field::IoRead | Field::IoWrite => "disk reads | writes",
+
+            Field::NetDown | Field::NetUp => "download | upload",
+
         }
     }
 
     fn tile_color(&self, t: &Tile) -> Color32 {
         if t.free {
-            return if t.name == "Other" { rgb(0x1C2029) } else { rgb(0x15181F) };
+            return match t.name.as_str() {
+                "Other" | "Files" => rgb(0x1C2029),
+                "Not scanned yet" => rgb(0x191C24),
+                _ => rgb(0x15181F),
+            };
         }
         if self.heat { heat_color(t.cpu) } else { mix(app_color(&t.name), BG, 0.25) }
     }
@@ -650,7 +818,7 @@ impl App {
         match &self.sel {
             Some(Hit::Pid(p)) => self.by_pid.get(p).map(|&i| vec![&self.procs[i]]).unwrap_or_default(),
             Some(Hit::Group(n)) => self.groups.get(n).map(|v| v.iter().map(|&i| &self.procs[i]).collect()).unwrap_or_default(),
-            None => Vec::new(),
+            Some(Hit::Dir(_)) | None => Vec::new(),
         }
     }
 
@@ -672,7 +840,10 @@ impl App {
                 Col::Private => q.private,
                 Col::GpuMem => q.gpu_mem,
                 Col::Gpu => q.gpu,
-                Col::Io => q.io,
+                Col::IoR => q.io_r,
+                Col::IoW => q.io_w,
+                Col::NetD => q.net_d,
+                Col::NetU => q.net_u,
                 Col::Threads => q.threads as f64,
                 Col::Create => q.create as f64,
                 Col::Name | Col::Cmd => 0.0,
@@ -708,7 +879,7 @@ impl App {
                 let gm = if pdh { format!("{} VRAM · {:.0}% GPU", fmt_bytes(q.gpu_mem), q.gpu) } else { "GPU n/a".into() };
                 let cmd: String = if q.cmd.is_empty() { "(command line not accessible)".into() } else { q.cmd.chars().take(300).collect() };
                 let body = format!(
-                    "PID {}  ·  parent {}  ·  {}\nRAM {}  ·  private {}\nCPU {:.1}%  ·  {gm}  ·  {} threads\nDisk I/O {}\n{cmd}",
+                    "PID {}  ·  parent {}  ·  {}\nRAM {}  ·  private {}\nCPU {:.1}%  ·  {gm}  ·  {} threads\nDisk read {}  ·  write {}\nNetwork down {}  ·  up {}\n{cmd}",
                     q.pid,
                     q.ppid,
                     self.username(q.pid),
@@ -716,7 +887,10 @@ impl App {
                     fmt_bytes(q.private),
                     q.cpu * k,
                     q.threads,
-                    fmt_rate(q.io)
+                    fmt_rate(q.io_r),
+                    fmt_rate(q.io_w),
+                    fmt_rate(q.net_d),
+                    fmt_rate(q.net_u)
                 );
                 (q.name.clone(), body)
             }
@@ -728,7 +902,7 @@ impl App {
                 }
                 let sum = |f: fn(&Proc) -> f64| qs.iter().map(|q| f(q)).sum::<f64>();
                 let body = format!(
-                    "{} processes  ·  PIDs {}\nRAM {}  ·  private {}\nCPU {:.1}%  ·  {} VRAM  ·  {:.0}% GPU\nDisk I/O {}\nDouble-click to show its processes",
+                    "{} processes  ·  PIDs {}\nRAM {}  ·  private {}\nCPU {:.1}%  ·  {} VRAM  ·  {:.0}% GPU\nDisk read {}  ·  write {}\nNetwork down {}  ·  up {}\nDouble-click to show its processes",
                     qs.len(),
                     pids.join(", "),
                     fmt_bytes(sum(|q| q.ws)),
@@ -736,9 +910,28 @@ impl App {
                     sum(|q| q.cpu) * k,
                     fmt_bytes(sum(|q| q.gpu_mem)),
                     qs.iter().map(|q| q.gpu).fold(0.0, f64::max),
-                    fmt_rate(sum(|q| q.io))
+                    fmt_rate(sum(|q| q.io_r)),
+                    fmt_rate(sum(|q| q.io_w)),
+                    fmt_rate(sum(|q| q.net_d)),
+                    fmt_rate(sum(|q| q.net_u))
                 );
                 (name.clone(), body)
+            }
+            Hit::Dir(id) => {
+                let Some(s) = &self.space else { return Default::default() };
+                let g = s.scan.tree.lock().unwrap();
+                let n = &g.nodes[*id as usize];
+                let parent = if *id == 0 { n.total } else { g.nodes[n.parent as usize].total };
+                let share = if parent > 0 { n.total as f64 / parent as f64 * 100.0 } else { 0.0 };
+                let body = format!(
+                    "{}\n{}  ·  {share:.0}% of its parent folder\n{} subfolders  ·  {} in files directly here{}",
+                    g.path(*id),
+                    fmt_bytes(n.total as f64),
+                    n.children.len(),
+                    fmt_bytes(n.files as f64),
+                    if n.children.is_empty() { "" } else { "\nDouble-click to open it" }
+                );
+                (n.name.to_string(), body)
             }
         }
     }
@@ -797,6 +990,9 @@ impl App {
 // ------------------------------------------------------------------ drawing
 
 struct Gauge<'a> {
+    icon: &'static str,
+    vi: &'static str, // optional icons before the value and the sub line (disk: read / write, network: down / up)
+    si: &'static str,
     title: String,
     value: String,
     sub: String,
@@ -817,14 +1013,25 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
     let w = inner.width();
     let tc = if selected { TEXT } else { MUTED };
     let mut y = inner.top();
+    // the icon in the card's colour, then the label
+    let ic = if selected { g.s1.1 } else { mix(g.s1.1, MUTED, 0.35) };
     if small {
-        text(&p, pos2(inner.left(), y + 9.0), Align2::LEFT_CENTER, &g.title, bold(10.0), tc, w * 0.5);
-        text(&p, pos2(inner.right(), y + 9.0), Align2::RIGHT_CENTER, &g.value, bold(15.0), TEXT, w * 0.6);
+        p.text(pos2(inner.left(), y + 9.0), Align2::LEFT_CENTER, g.icon, icons(12.0), ic);
+        text(&p, pos2(inner.left() + 18.0, y + 9.0), Align2::LEFT_CENTER, &g.title, bold(10.0), tc, w * 0.5);
+        let vr = text(&p, pos2(inner.right(), y + 9.0), Align2::RIGHT_CENTER, &g.value, bold(15.0), TEXT, w * 0.6);
+        if !g.vi.is_empty() {
+            p.text(pos2(vr.left() - 5.0, y + 9.0), Align2::RIGHT_CENTER, g.vi, icons(12.0), g.s1.1);
+        }
         y += 21.0;
     } else {
-        text(&p, pos2(inner.left(), y), Align2::LEFT_TOP, &g.title, bold(10.0), tc, w);
+        p.text(pos2(inner.left(), y + 6.0), Align2::LEFT_CENTER, g.icon, icons(12.0), ic);
+        text(&p, pos2(inner.left() + 18.0, y), Align2::LEFT_TOP, &g.title, bold(10.0), tc, w - 18.0);
         y += 16.0;
-        text(&p, pos2(inner.left(), y), Align2::LEFT_TOP, &g.value, bold(20.0), TEXT, w);
+        let dx = if g.vi.is_empty() { 0.0 } else { 22.0 };
+        if !g.vi.is_empty() {
+            p.text(pos2(inner.left(), y + 13.0), Align2::LEFT_CENTER, g.vi, icons(15.0), g.s1.1);
+        }
+        text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.value, bold(20.0), TEXT, w - dx);
         y += 28.0;
     }
     match g.cores {
@@ -840,7 +1047,11 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
             }
         }
         _ => {
-            text(&p, pos2(inner.left(), y), Align2::LEFT_TOP, &g.sub, font(11.0), MUTED, w);
+            let dx = if g.si.is_empty() { 0.0 } else { 17.0 };
+            if let (false, Some((_, c2))) = (g.si.is_empty(), g.s2) {
+                p.text(pos2(inner.left() + 1.0, y + 7.0), Align2::LEFT_CENTER, g.si, icons(11.0), c2);
+            }
+            text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.sub, font(11.0), MUTED, w - dx);
         }
     }
     y += 17.0;
@@ -851,15 +1062,79 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
     }
 }
 
-fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool) {
+/// Which processes ran on each logical CPU: [cpu] -> [(process index, % of that CPU)].
+///
+/// Windows does not say where a thread ran (that needs a kernel trace, i.e. administrator). We know each
+/// process's CPU time and each CPU's load exactly, and each busy thread's ideal processor (where the
+/// scheduler prefers it; under load it often runs elsewhere). So the ideal processors are only the
+/// starting guess, and the table is balanced (iterative proportional fitting) until every process row
+/// sums to its measured CPU and every CPU column to its measured load.
+fn split_by_cpu(procs: &[Proc], loads: &[f32]) -> Vec<Vec<(usize, f32)>> {
+    let k = loads.len();
+    let busy: Vec<usize> = (0..procs.len()).filter(|&i| procs[i].cpu > 0.05).collect();
+    let mut out = vec![Vec::new(); k];
+    let total_load: f64 = loads.iter().map(|&l| l as f64).sum();
+    if busy.is_empty() || k == 0 || total_load <= 0.0 {
+        return out;
+    }
+    let rows: Vec<f64> = busy.iter().map(|&i| procs[i].cpu * k as f64).collect(); // in "% of one CPU"
+    let scale = total_load / rows.iter().sum::<f64>().max(1e-9);
+    let cols: Vec<f64> = loads.iter().map(|&l| l as f64 / scale.max(1.0)).collect(); // processes may not explain all load
+    let mut m: Vec<Vec<f64>> = busy
+        .iter()
+        .zip(&rows)
+        .map(|(&i, &row)| {
+            (0..k)
+                .map(|c| {
+                    let ideal = procs[i].cpus.iter().find(|e| e.0 as usize == c).map_or(0.0, |e| e.1 as f64);
+                    ideal + 0.15 * row * loads[c] as f64 / total_load // anything can run anywhere
+                })
+                .collect()
+        })
+        .collect();
+    for _ in 0..30 {
+        for (r, &target) in m.iter_mut().zip(&rows) {
+            let s: f64 = r.iter().sum();
+            if s > 0.0 {
+                r.iter_mut().for_each(|v| *v *= target / s);
+            }
+        }
+        for c in 0..k {
+            let s: f64 = m.iter().map(|r| r[c]).sum();
+            if s > 0.0 {
+                let f = cols[c] / s;
+                m.iter_mut().for_each(|r| r[c] *= f);
+            }
+        }
+    }
+    for (r, &i) in m.iter().zip(&busy) {
+        for (c, &v) in r.iter().enumerate() {
+            if v > 0.05 {
+                out[c].push((i, v as f32));
+            }
+        }
+    }
+    out
+}
+
+/// Space per volume. Returns each row's rect (the full view opens a drive's space map on click).
+fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool, selected: Option<&str>) -> Vec<(String, Rect)> {
     let p = ui.painter().with_clip_rect(r);
-    card(&p, r, false);
+    card(&p, r, selected.is_some());
     let inner = r.shrink2(vec2(12.0, 9.0));
-    text(&p, inner.left_top(), Align2::LEFT_TOP, "DRIVES", bold(10.0), MUTED, inner.width());
+    let ic = if selected.is_some() { TEXT } else { MUTED };
+    p.text(pos2(inner.left(), inner.top() + 6.0), Align2::LEFT_CENTER, I_DRIVES, icons(12.0), ic);
+    let title = if small { "DRIVES" } else { "DRIVES · click for folders" };
+    text(&p, inner.left_top() + vec2(18.0, 0.0), Align2::LEFT_TOP, if selected.is_some() { "DRIVES · FOLDERS" } else { title }, bold(10.0), ic, inner.width() - 18.0);
     let mut y = inner.top() + 22.0;
     let step = if small { 17.0 } else { 18.0 };
+    let mut rows = Vec::new();
     for (mount, used, total) in drives {
         let cy = y + 6.0;
+        rows.push((mount.clone(), Rect::from_min_max(pos2(r.left(), cy - step / 2.0), pos2(r.right(), cy + step / 2.0))));
+        if selected == Some(mount.as_str()) {
+            p.rect_filled(Rect::from_min_max(pos2(inner.left() - 6.0, cy - step / 2.0), pos2(inner.right() + 6.0, cy + step / 2.0)), 5.0, PILL_ON);
+        }
         text(&p, pos2(inner.left(), cy), Align2::LEFT_CENTER, mount, font(11.0), TEXT, 24.0);
         let free = format!("{} free", fmt_bytes((total - used) as f64));
         let fr = text(&p, pos2(inner.right(), cy), Align2::RIGHT_CENTER, &free, font(11.0), MUTED, 90.0);
@@ -869,6 +1144,7 @@ fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool) {
         p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 4.0)), 2.0, if f > 0.9 { DANGER } else { MUTED });
         y += step;
     }
+    rows
 }
 
 /// A text button drawn by hand (labels only: they already say what they do).
@@ -924,10 +1200,13 @@ impl App {
         let h = &self.hist;
         let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
         let mut v = vec![
-            ("cpu", Gauge { title: "CPU".into(), value: format!("{:.0}%", s.cpu), sub: String::new(), cores: Some(&s.per_core), s1: (&h.cpu, C_CPU), s2: None, top: 100.0 }),
+            ("cpu", Gauge { icon: I_CPU, vi: "", si: "", title: "CPU".into(), value: format!("{:.0}%", s.cpu), sub: String::new(), cores: Some(&s.per_core), s1: (&h.cpu, C_CPU), s2: None, top: 100.0 }),
             (
                 "ram",
                 Gauge {
+                    icon: I_RAM,
+                    vi: "",
+                    si: "",
                     title: if !small && self.metric == Field::Private { "MEMORY · PRIVATE".into() } else { "MEMORY".into() },
                     value: format!("{:.1} / {}", gb(s.ram_used), fmt_bytes(s.ram_total as f64)),
                     sub: format!("Commit {} of {}", fmt_bytes(s.commit as f64), fmt_bytes(s.commit_limit as f64)),
@@ -942,6 +1221,9 @@ impl App {
             v.push((
                 "commit",
                 Gauge {
+                    icon: I_COMMIT,
+                    vi: "",
+                    si: "",
                     title: "COMMIT".into(),
                     value: format!("{:.1} / {}", gb(s.commit), fmt_bytes(s.commit_limit as f64)),
                     sub: format!("{:.0}% of the commit limit", s.commit as f64 / s.commit_limit.max(1) as f64 * 100.0),
@@ -960,16 +1242,19 @@ impl App {
             }
             None => ("n/a".into(), s.gpu_err.clone().unwrap_or_else(|| "No NVIDIA GPU".into())),
         };
-        v.push(("gpu", Gauge { title: "GPU".into(), value: gv, sub: gs, cores: None, s1: (&h.gpu, C_GPU), s2: None, top: 100.0 }));
+        v.push(("gpu", Gauge { icon: I_GPU, vi: "", si: "", title: "GPU".into(), value: gv, sub: gs, cores: None, s1: (&h.gpu, C_GPU), s2: None, top: 100.0 }));
         let (vv, vs) = if g.mem_total > 0 { (format!("{:.1} / {}", gb(g.mem_used), fmt_bytes(g.mem_total as f64)), g.name.replace("NVIDIA GeForce ", "")) } else { ("-".into(), String::new()) };
-        v.push(("vram", Gauge { title: "VRAM".into(), value: vv, sub: vs, cores: None, s1: (&h.vram, C_VRAM), s2: None, top: 100.0 }));
+        v.push(("vram", Gauge { icon: I_VRAM, vi: "", si: "", title: "VRAM".into(), value: vv, sub: vs, cores: None, s1: (&h.vram, C_VRAM), s2: None, top: 100.0 }));
         let mx = |a: &VecDeque<f32>, b: &VecDeque<f32>, floor: f32| a.iter().chain(b).fold(floor, |m, &x| m.max(x));
         v.push((
             "disk",
             Gauge {
-                title: "DISK  read / write".into(),
+                icon: I_DISK,
+                title: "DISK".into(),
                 value: fmt_rate(s.disk_r),
-                sub: format!("write {}", fmt_rate(s.disk_w)),
+                sub: format!("{} write", fmt_rate(s.disk_w)),
+                vi: I_READ,
+                si: I_WRITE,
                 cores: None,
                 s1: (&h.disk_r, C_DISK),
                 s2: Some((&h.disk_w, C_DISK2)),
@@ -979,9 +1264,12 @@ impl App {
         v.push((
             "net",
             Gauge {
-                title: "NETWORK  down / up".into(),
+                icon: I_NET,
+                title: "NETWORK".into(),
                 value: fmt_rate(s.net_d),
-                sub: format!("up {}", fmt_rate(s.net_u)),
+                sub: format!("{} up", fmt_rate(s.net_u)),
+                vi: I_DOWN,
+                si: I_UP,
                 cores: None,
                 s1: (&h.net_d, C_NET),
                 s2: Some((&h.net_u, C_NET2)),
@@ -997,15 +1285,16 @@ impl App {
         let p = ui.painter();
         p.rect(r, CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 }, alpha(rgb(0x222631), 0xF2), Stroke::new(1.0, rgb(0x3A4150)), StrokeKind::Inside);
         let vals = self.tot.as_ref().map_or([0.0; 3], |s| [s.cpu, s.ram_used as f32 / s.ram_total.max(1) as f32 * 100.0, s.gpu.util.unwrap_or(0.0)]);
-        let bh = TAB.y - 36.0;
-        let x0 = r.center().x + 1.5 - (3.0 * 4.0 + 2.0 * 3.0) / 2.0;
-        for (i, (v, c)) in vals.iter().zip([C_CPU, C_RAM, C_GPU]).enumerate() {
+        // three bars, each with its icon underneath (CPU, memory, GPU)
+        let (top, bh, pitch) = (r.top() + 14.0, TAB.y - 44.0, 9.0);
+        let x0 = r.center().x + 1.5 - (2.0 * pitch + 4.0) / 2.0;
+        for (i, ((v, c), ic)) in vals.iter().zip([C_CPU, C_RAM, C_GPU]).zip([I_CPU, I_RAM, I_GPU]).enumerate() {
             // no easing here: the docked tab is always on screen, and an animation every 0.5 s kept it at ~36 fps (3% of a core)
-            let v = *v;
-            let tr = Rect::from_min_size(pos2(x0 + i as f32 * 7.0, r.center().y - bh / 2.0), vec2(4.0, bh));
+            let tr = Rect::from_min_size(pos2(x0 + i as f32 * pitch, top), vec2(4.0, bh));
             p.rect_filled(tr, 2.0, LINE);
             let fh = (v / 100.0).clamp(0.02, 1.0) * bh;
             p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 2.0, c);
+            p.text(pos2(tr.center().x, tr.bottom() + 10.0), Align2::CENTER_CENTER, ic, icons(8.5), mix(c, MUTED, 0.25));
         }
         // hand on hover (it is a button); the move cursor only once it is held: a drag or a long press
         let resp = ui.interact(r, Id::unique("tab"), Sense::click_and_drag());
@@ -1071,7 +1360,7 @@ impl App {
         }
         if let Some(s) = &self.tot {
             let dh = 31.0 + 17.0 * s.drives.len() as f32;
-            draw_drives(&ui, Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), dh)), &s.drives, true);
+            draw_drives(&ui, Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), dh)), &s.drives, true, None);
         }
         let foot = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 34.0), inner.max);
         let mut fu = ui.new_child(UiBuilder::new().max_rect(foot).layout(Layout::left_to_right(Align::Center)));
@@ -1131,6 +1420,7 @@ impl App {
         self.toolbar(&mut ui, tb, now);
         let rest = inner.bottom() - tb.bottom() - 10.0 - 40.0 - 20.0;
         let tm = Rect::from_min_size(pos2(inner.left(), tb.bottom() + 10.0), vec2(inner.width(), (rest * 0.6).floor()));
+        self.space_tick(now);
         self.treemap(&mut ui, tm, now);
         let sb = Rect::from_min_size(pos2(inner.left(), tm.bottom() + 10.0), vec2(inner.width(), 40.0));
         self.selbar(&mut ui, sb, now);
@@ -1195,40 +1485,73 @@ impl App {
                 "ram" => Some(Field::Ws),
                 "gpu" => Some(Field::Gpu),
                 "vram" => Some(Field::GpuMem),
-                "disk" => Some(Field::Io),
+                "disk" => Some(Field::IoRead),
+                "net" => Some(Field::NetDown),
                 _ => None,
             };
-            let on = metric.is_some_and(|m| m == self.metric || (*key == "ram" && self.metric == Field::Private));
+            // a card with two measures (memory, disk, network) lights up for either
+            let pair = |a: Field, b: Field| self.metric == a || self.metric == b;
+            let on = self.space.is_none()
+                && match *key {
+                    "ram" => pair(Field::Ws, Field::Private),
+                    "disk" => pair(Field::IoRead, Field::IoWrite),
+                    "net" => pair(Field::NetDown, Field::NetUp),
+                    _ => metric == Some(self.metric),
+                };
             draw_gauge(ui, gr, g, false, on);
             if let Some(m) = metric {
-                let tip = format!("Size the treemap by {}", if *key == "ram" { "memory (click again for private bytes)" } else { g.title.split(' ').next().unwrap_or("") });
+                let tip = match *key {
+                    "ram" => "Size the treemap by memory (click again for private bytes)".to_string(),
+                    "disk" => "Who reads and who writes the disk, side by side".to_string(),
+                    "net" => "Who downloads and who uploads, side by side".to_string(),
+                    _ => format!("Size the treemap by {}", g.title),
+                };
                 let resp = ui.interact(gr, Id::unique(("card", *key)), Sense::click()).on_hover_text(tip);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 }
                 if resp.clicked() {
-                    // MEMORY clicked again flips working set / private bytes
-                    pick = Some(match (m, self.metric) {
-                        (Field::Ws, Field::Ws) => Field::Private,
-                        (Field::Ws, Field::Private) => Field::Ws,
+                    // clicked again, a two-measure card flips between its measures
+                    pick = Some(match (m, self.metric, on) {
+                        (Field::Ws, Field::Ws, true) => Field::Private,
                         _ => m,
                     });
                 }
             }
         }
+        let mut drive = None;
         if let Some(s) = &self.tot {
             let dr = Rect::from_min_size(pos2(r.right() - w, r.top()), vec2(w, r.height()));
-            draw_drives(ui, dr, &s.drives, false);
+            let sel = self.space.as_ref().map(|s| s.scan.root.clone());
+            let rows = draw_drives(ui, dr, &s.drives, false, sel.as_deref());
+            let resp = ui.interact(dr, Id::unique("drives"), Sense::click()).on_hover_text("Click a drive to see what fills it, folder by folder");
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                let at = resp.interact_pointer_pos().unwrap_or(dr.center());
+                drive = rows.iter().find(|(_, rr)| rr.contains(at)).or(rows.first()).map(|(m, _)| m.clone());
+            }
         }
         if let Some(m) = pick {
-            self.metric = m;
+            (self.metric, self.space) = (m, None);
+            if m != Field::Cpu {
+                self.per_core = false; // per core only means something for CPU
+            }
             self.relayout(now);
+        }
+        if let Some(d) = drive {
+            self.open_space(&d, now, &ui.ctx().clone());
         }
     }
 
     fn toolbar(&mut self, ui: &mut Ui, r: Rect, now: f64) {
         let mut tu = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::left_to_right(Align::Center)));
         tu.spacing_mut().item_spacing.x = 4.0;
+        if self.space.is_some() {
+            self.space_toolbar(&mut tu, now);
+            return;
+        }
         if link(&mut tu, "All processes", if self.zoom.is_some() { MUTED } else { TEXT }, 14.0).clicked() && self.zoom.is_some() {
             self.zoom = None;
             self.relayout(now);
@@ -1239,7 +1562,14 @@ impl App {
         }
         let n = if self.zoom.is_some() { self.tiles.iter().filter(|t| t.hit.is_some()).count() } else { self.tiles.iter().filter(|t| t.hit.is_some()).map(|t| &t.name).collect::<HashSet<_>>().len() };
         let by = format!("Sized by {}{}", self.metric_label(), if self.whole().is_some() { " · share of total" } else { "" });
-        let count = if self.zoom.is_some() { format!("{by}  ·  {n} processes") } else { format!("{by}  ·  {n} apps · {} processes", self.procs.len()) };
+        let count = if self.per_core && self.metric == Field::Cpu {
+            let threads: usize = self.cores.iter().map(|c| c.0.len()).sum();
+            format!("Per core  ·  {} cores, {threads} threads", self.cores.len())
+        } else if self.zoom.is_some() {
+            format!("{by}  ·  {n} processes")
+        } else {
+            format!("{by}  ·  {n} apps · {} processes", self.procs.len())
+        };
         tu.add_space(8.0);
         tu.label(egui::RichText::new(count).font(font(12.0)).color(FAINT));
         tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
@@ -1247,22 +1577,161 @@ impl App {
             if let Some(i) = pills(tu, &[("App", !self.heat), ("CPU heat", self.heat)]) {
                 self.heat = i == 1;
             }
-            if pills(tu, &[("Per core", self.per_core)]).is_some() {
-                self.per_core = !self.per_core;
+            if self.metric == Field::Cpu {
+                // only CPU has cores to count against
+                if pills(tu, &[("Per core", self.per_core)]).is_some() {
+                    self.per_core = !self.per_core;
+                }
             }
-            let can = self.metric != Field::Io; // disk I/O has no total to share
-            tu.add_enabled_ui(can, |tu| {
+            if !self.metric.is_rate() && !(self.per_core && self.metric == Field::Cpu) {
+                // rates have no total to share
                 if pills(tu, &[("Share of total", self.relative)]).is_some() {
                     self.relative = !self.relative;
                     self.relayout(now);
                 }
-            })
-            .response
-            .on_hover_text("Size tiles against the machine total, with the free part as its own tile");
+            }
         });
     }
 
+    /// Disk space map: the folder path as a breadcrumb, the scan's progress, Share of total (free space).
+    fn space_toolbar(&mut self, tu: &mut Ui, now: f64) {
+        let Some(sv) = &self.space else { return };
+        let (chain, status) = {
+            let g = sv.scan.tree.lock().unwrap();
+            let mut chain = vec![sv.at];
+            while *chain.last().unwrap() != 0 {
+                chain.push(g.nodes[*chain.last().unwrap() as usize].parent);
+            }
+            chain.reverse();
+            let chain: Vec<(u32, String)> = chain.into_iter().map(|id| (id, g.nodes[id as usize].name.to_string())).collect();
+            let found = fmt_bytes(g.nodes[0].total as f64);
+            let denied = if g.denied > 0 { format!(" · {} folders not readable", g.denied) } else { String::new() };
+            let status = match g.took {
+                Some(t) => format!("{} folders, {found} in files · scanned in {:.0} s{denied}", g.folders, t),
+                None => format!("Scanning… {} folders, {found} of {} used{denied}", g.folders, fmt_bytes(sv.used as f64)),
+            };
+            (chain, status)
+        };
+        let mut go = None;
+        let last = chain.len() - 1;
+        for (i, (id, name)) in chain.iter().enumerate() {
+            if i > 0 {
+                tu.label(egui::RichText::new("\u{E76C}").font(icons(11.0)).color(FAINT));
+            }
+            if link(tu, name, if i == last { TEXT } else { MUTED }, 14.0).clicked() && i != last {
+                go = Some(*id);
+            }
+        }
+        tu.add_space(8.0);
+        tu.label(egui::RichText::new(status).font(font(12.0)).color(FAINT));
+        tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
+            tu.spacing_mut().item_spacing.x = 8.0;
+            if pills(tu, &[("Share of total", self.relative)]).is_some() {
+                self.relative = !self.relative;
+                self.relayout(now);
+            }
+        });
+        if let Some(id) = go {
+            if let Some(s) = &mut self.space {
+                s.at = id;
+            }
+            self.sel = None;
+            self.relayout(now);
+        }
+    }
+
+    /// "Per core": the CPU split into its physical cores, each with its threads (logical processors) side by
+    /// side, filled by load. On a hybrid CPU each core says whether it is a performance or efficiency core.
+    fn draw_cores(&mut self, ui: &Ui, r: Rect) {
+        let p = ui.painter().with_clip_rect(r);
+        p.rect_filled(r, 10.0, rgb(0x12151B));
+        let Some(t) = self.tot.clone() else { return };
+        let on_cpu = split_by_cpu(&self.procs, &t.per_core);
+        let mut segs: Vec<(Rect, usize)> = Vec::new(); // for hover and click
+        let cores: Vec<(Vec<usize>, u8)> = if self.cores.is_empty() { (0..t.per_core.len()).map(|i| (vec![i], 0)).collect() } else { self.cores.clone() };
+        let n = cores.len().max(1);
+        let hybrid = cores.iter().any(|c| c.1 != cores[0].1);
+        let top_class = cores.iter().map(|c| c.1).max().unwrap_or(0);
+        let (w, h) = (r.width() - 8.0, r.height() - 8.0);
+        // the grid whose cells are closest to square
+        let cols = (1..=n).min_by_key(|&c| ((w / c as f32) / (h / n.div_ceil(c) as f32)).ln().abs().mul_add(1000.0, 0.0) as i64).unwrap_or(1);
+        let rows = n.div_ceil(cols);
+        let (cw, ch) = (w / cols as f32, h / rows as f32);
+        for (i, (threads, class)) in cores.iter().enumerate() {
+            let cell = Rect::from_min_size(r.min + vec2(4.0 + (i % cols) as f32 * cw, 4.0 + (i / cols) as f32 * ch), vec2(cw, ch)).shrink(3.0);
+            let loads: Vec<f32> = threads.iter().map(|&k| t.per_core.get(k).copied().unwrap_or(0.0)).collect();
+            let avg = loads.iter().sum::<f32>() / loads.len().max(1) as f32;
+            p.rect_filled(cell, 6.0, mix(C_CPU, BG, 0.86));
+            let kind = if hybrid { if *class == top_class { " · P-core" } else { " · E-core" } } else { "" };
+            text(&p, cell.min + vec2(8.0, 6.0), Align2::LEFT_TOP, &format!("Core {i}{kind}"), bold(12.0), TEXT, cell.width() - 70.0);
+            text(&p, pos2(cell.right() - 8.0, cell.top() + 6.0), Align2::RIGHT_TOP, &format!("{avg:.0}%"), bold(12.0), TEXT, 60.0);
+            let inner = Rect::from_min_max(cell.min + vec2(8.0, 28.0), cell.max - vec2(8.0, 8.0));
+            let tn = loads.len().max(1) as f32;
+            let tw = (inner.width() - 6.0 * (tn - 1.0)) / tn;
+            for (j, (&v, &k)) in loads.iter().zip(threads).enumerate() {
+                let tr = Rect::from_min_size(pos2(inner.left() + j as f32 * (tw + 6.0), inner.top()), vec2(tw, inner.height()));
+                p.rect_filled(tr, 4.0, LINE);
+                let fh = (v / 100.0).clamp(0.0, 1.0) * tr.height();
+                if fh > 0.5 {
+                    p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 4.0, mix(rgb(0x2B4F7A), C_CPU, v / 100.0));
+                }
+                // the fill split into the processes that ran here, biggest at the bottom, scaled to the
+                // measured load (the attribution is an estimate, the load is not)
+                let mut procs = on_cpu.get(k).cloned().unwrap_or_default();
+                procs.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let est: f32 = procs.iter().map(|x| x.1).sum();
+                let scale = if est > v { v / est } else { 1.0 };
+                let mut y = tr.bottom();
+                for (pi, pct) in procs {
+                    let sh = (pct * scale / 100.0) * tr.height();
+                    if sh < 2.0 {
+                        continue;
+                    }
+                    let sr = Rect::from_min_max(pos2(tr.left(), y - sh), pos2(tr.right(), y));
+                    let name = &self.procs[pi].name;
+                    p.rect_filled(sr.shrink2(vec2(0.0, 0.5)), 3.0, mix(app_color(name), BG, 0.15));
+                    if sh >= 15.0 {
+                        text(&p, pos2(sr.left() + 5.0, sr.center().y), Align2::LEFT_CENTER, name, font(10.0), alpha(Color32::WHITE, 0xE0), tw - 10.0);
+                    }
+                    segs.push((sr, pi));
+                    y -= sh;
+                }
+                text(&p, tr.min + vec2(6.0, 4.0), Align2::LEFT_TOP, &format!("Thread {}", j + 1), font(10.0), MUTED, tw - 10.0);
+                text(&p, tr.min + vec2(6.0, 17.0), Align2::LEFT_TOP, &format!("CPU {k}  ·  {v:.0}%"), font(10.0), TEXT, tw - 10.0);
+            }
+        }
+        // hover: which process, how much of this CPU; click selects it
+        let resp = ui.interact(r, Id::unique("cores"), Sense::click());
+        let Some(pos) = resp.hover_pos() else { return };
+        let Some(&(sr, pi)) = segs.iter().find(|s| s.0.contains(pos)) else { return };
+        let q = &self.procs[pi];
+        p.rect_stroke(sr, 3.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Inside);
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        if resp.clicked() {
+            self.sel = Some(Hit::Pid(q.pid));
+        }
+        let lines: Vec<String> = on_cpu.iter().enumerate().filter_map(|(c, v)| v.iter().find(|e| e.0 == pi).map(|e| format!("CPU {c}: {:.0}%", e.1))).collect();
+        let body = format!(
+            "PID {}  ·  {:.1}% of the machine\n{}\nWhere it ran is an estimate (Windows records it only for administrators); the totals are measured.",
+            q.pid,
+            q.cpu,
+            lines.join("  ·  ")
+        );
+        let g = p.layout(body, font(11.0), MUTED, 296.0);
+        let sz = vec2(320.0, g.size().y + 44.0);
+        let x = if pos.x + 16.0 + sz.x < r.right() { pos.x + 16.0 } else { pos.x - sz.x - 16.0 };
+        let y = if pos.y + 16.0 + sz.y < r.bottom() { pos.y + 16.0 } else { pos.y - sz.y - 8.0 };
+        let tr = Rect::from_min_size(pos2(x, y), sz);
+        p.rect(tr, 10.0, alpha(rgb(0x1C2029), 0xF5), Stroke::new(1.0, LINE), StrokeKind::Inside);
+        text(&p, tr.min + vec2(12.0, 12.0), Align2::LEFT_TOP, &q.name, bold(13.0), TEXT, 296.0);
+        p.galley(tr.min + vec2(12.0, 34.0), g, MUTED);
+    }
+
     fn treemap(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        if self.per_core && self.metric == Field::Cpu && self.space.is_none() {
+            self.draw_cores(ui, r);
+            return;
+        }
         let p = ui.painter().with_clip_rect(r);
         p.rect_filled(r, 10.0, rgb(0x12151B));
         if (r.size() - self.tm_size).length() > 0.5 {
@@ -1301,8 +1770,20 @@ impl App {
                 }
             }
         }
-        if self.tiles.is_empty() && !self.procs.is_empty() {
-            p.text(r.center(), Align2::CENTER_CENTER, "Nothing uses this resource right now", font(13.0), FAINT);
+        if self.tiles.is_empty() && self.split_fields().is_none() {
+            let net_err = self.tot.as_ref().and_then(|t| t.net_err.clone()).filter(|_| matches!(self.metric, Field::NetDown | Field::NetUp));
+            let msg = if self.space.is_some() {
+                Some("Scanning…".to_string())
+            } else if let Some(e) = net_err {
+                Some(e)
+            } else if self.metric.is_rate() && !self.procs.is_empty() {
+                Some("No process is moving data right now".to_string())
+            } else {
+                (!self.procs.is_empty()).then(|| "Nothing uses this resource right now".to_string())
+            };
+            if let Some(m) = msg {
+                p.text(r.center(), Align2::CENTER_CENTER, m, font(13.0), FAINT);
+            }
         }
         let resp = ui.interact(r, Id::unique("treemap"), Sense::click());
         // children were laid out after their group: test them first; a group answers on its header band only
@@ -1314,18 +1795,38 @@ impl App {
         };
         let pos = resp.hover_pos();
         let target = pos.and_then(hit_at);
-        let rect_of = |h: &Hit| -> Option<Rect> {
+        // a split view has the same process in both halves: outline it in both
+        let rects_of = |h: &Hit| -> Vec<Rect> {
             let k = match h {
                 Hit::Pid(p) => Key::Pid(*p),
                 Hit::Group(n) => Key::Group(n.clone()),
+                Hit::Dir(d) => Key::Dir(*d),
             };
-            self.tiles.iter().zip(&rects).find(|(t, _)| t.key == k).map(|(_, r)| *r)
+            self.tiles.iter().zip(&rects).filter(|(t, _)| t.key == k || matches!(&t.key, Key::Side(_, b) if **b == k)).map(|(_, r)| *r).collect()
         };
-        if let Some(sr) = self.sel.as_ref().and_then(rect_of) {
+        for sr in self.sel.as_ref().map(rects_of).unwrap_or_default() {
             p.rect_stroke(sr, 4.0, Stroke::new(2.5, Color32::WHITE), StrokeKind::Inside);
         }
-        if let Some(hr) = target.as_ref().filter(|h| Some(*h) != self.sel.as_ref()).and_then(rect_of) {
+        for hr in target.as_ref().filter(|h| Some(*h) != self.sel.as_ref()).map(rects_of).unwrap_or_default() {
             p.rect_stroke(hr, 4.0, Stroke::new(1.5, alpha(Color32::WHITE, 0x90)), StrokeKind::Inside);
+        }
+        if let Some((a, b)) = self.split_fields() {
+            let hw = (r.width() - SPLIT_GAP) / 2.0;
+            let labels = if a == Field::IoRead { [(I_READ, "Read", C_DISK), (I_WRITE, "Write", C_DISK2)] } else { [(I_DOWN, "Download", C_NET), (I_UP, "Upload", C_NET2)] };
+            for (side, (f, (ic, label, c))) in [a, b].into_iter().zip(labels).enumerate() {
+                let x = r.left() + side as f32 * (hw + SPLIT_GAP);
+                let cap = Rect::from_min_size(pos2(x, r.top()), vec2(hw, SPLIT_CAPTION));
+                let total: f64 = self.procs.iter().map(|q| q.get(f)).sum();
+                p.text(pos2(cap.left() + 10.0, cap.center().y), Align2::LEFT_CENTER, ic, icons(14.0), c);
+                let tr = text(&p, pos2(cap.left() + 32.0, cap.center().y), Align2::LEFT_CENTER, label, bold(13.0), TEXT, 120.0);
+                text(&p, pos2(tr.right() + 10.0, cap.center().y), Align2::LEFT_CENTER, &fmt_rate(total), font(12.0), MUTED, 140.0);
+                let empty = !self.tiles.iter().any(|t| matches!(&t.key, Key::Side(s, _) if *s as usize == side));
+                if empty && !self.procs.is_empty() {
+                    let body = Rect::from_min_max(pos2(x, cap.bottom()), pos2(x + hw, r.bottom()));
+                    let net_err = self.tot.as_ref().and_then(|t| t.net_err.clone()).filter(|_| a == Field::NetDown);
+                    p.text(body.center(), Align2::CENTER_CENTER, net_err.unwrap_or_else(|| "Nothing right now".into()), font(12.0), FAINT);
+                }
+            }
         }
         if target.is_some() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -1333,11 +1834,17 @@ impl App {
         if resp.clicked() {
             self.sel = target.clone();
         }
+        if resp.double_clicked()
+            && let Some(Hit::Dir(id)) = &target
+        {
+            self.space_enter(*id, now);
+            return;
+        }
         if resp.double_clicked() && self.zoom.is_none() {
             let name = match &target {
                 Some(Hit::Group(n)) => Some(n.clone()),
                 Some(Hit::Pid(pid)) => self.by_pid.get(pid).map(|&i| self.procs[i].name.clone()),
-                None => None,
+                _ => None,
             };
             if let Some(n) = name.filter(|n| self.groups.get(n).is_some_and(|g| g.len() > 1)) {
                 self.zoom = Some(n);
@@ -1364,8 +1871,109 @@ impl App {
         }
     }
 
+    fn space_selbar(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        let Some(sv) = &self.space else { return };
+        let sel = match self.sel {
+            Some(Hit::Dir(d)) => Some(d),
+            _ => None,
+        };
+        let (msg, path, kids) = {
+            let g = sv.scan.tree.lock().unwrap();
+            match sel {
+                Some(d) => {
+                    let n = &g.nodes[d as usize];
+                    (format!("{}   {}   ·   {}", n.name, fmt_bytes(n.total as f64), g.path(d)), Some(g.path(d)), !n.children.is_empty())
+                }
+                None => ("Click a folder to select it, double-click to open it. Click a card above to go back to processes.".to_string(), None, false),
+            }
+        };
+        let c = if path.is_some() { TEXT } else { MUTED };
+        text(ui.painter(), pos2(r.left() + 12.0, r.center().y), Align2::LEFT_CENTER, &msg, font(12.0), c, r.width() - 24.0 - if path.is_some() { 330.0 } else { 0.0 });
+        let (Some(path), Some(d)) = (path, sel) else { return };
+        let mut au = ui.new_child(UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
+        if link(&mut au, "Show in Explorer", MUTED, 12.0).clicked() {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("explorer").raw_arg(format!("\"{path}\"")).spawn();
+        }
+        if link(&mut au, "Copy path", MUTED, 12.0).clicked() {
+            ui.ctx().copy_text(path);
+            self.toast("Copied path", false, now);
+        }
+        if kids && link(&mut au, "Open", MUTED, 12.0).clicked() {
+            self.space_enter(d, now);
+        }
+    }
+
+    /// Disk space map: the folders shown, biggest first.
+    fn space_table(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        let Some(sv) = &self.space else { return };
+        let rows: Vec<(u32, String, u64, u64, usize)> = {
+            let g = sv.scan.tree.lock().unwrap();
+            let mut v: Vec<_> = g.nodes[sv.at as usize]
+                .children
+                .iter()
+                .map(|&c| {
+                    let n = &g.nodes[c as usize];
+                    (c, n.name.to_string(), n.total, n.files, n.children.len())
+                })
+                .collect();
+            v.sort_by(|a, b| b.2.cmp(&a.2));
+            v
+        };
+        let parent: u64 = rows.iter().map(|r| r.2).sum::<u64>().max(1);
+        let mut tu = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Min)));
+        let cols: [(&str, f32, bool); 5] = [("Folder", 300.0, false), ("Size", 100.0, true), ("Share", 80.0, true), ("Files here", 100.0, true), ("Subfolders", 100.0, true)];
+        let (hr, _) = tu.allocate_exact_size(vec2(r.width(), 24.0), Sense::hover());
+        let mut x = r.left();
+        for (label, w, num) in cols {
+            let cr = Rect::from_min_size(pos2(x, hr.top()), vec2(w, 22.0));
+            let (pos, al) = if num { (pos2(cr.right() - 6.0, cr.center().y), Align2::RIGHT_CENTER) } else { (pos2(cr.left() + 6.0, cr.center().y), Align2::LEFT_CENTER) };
+            text(tu.painter(), pos, al, label, bold(11.0), MUTED, w - 12.0);
+            x += w;
+        }
+        tu.painter().line_segment([pos2(r.left(), hr.bottom()), pos2(r.right(), hr.bottom())], Stroke::new(1.0, LINE));
+        let sel = match self.sel {
+            Some(Hit::Dir(d)) => Some(d),
+            _ => None,
+        };
+        let (mut clicked, mut open) = (None, None);
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(&mut tu, 26.0, rows.len(), |ui, range| {
+            for (id, name, total, files, kids) in &rows[range] {
+                let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
+                if sel == Some(*id) {
+                    ui.painter().rect_filled(rr, 6.0, rgb(0x243049));
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rr, 6.0, alpha(TEXT, 10));
+                }
+                if resp.clicked() {
+                    clicked = Some(*id);
+                }
+                if resp.double_clicked() {
+                    open = Some(*id);
+                }
+                let vals = [name.clone(), fmt_bytes(*total as f64), format!("{:.1}%", *total as f64 / parent as f64 * 100.0), fmt_bytes(*files as f64), kids.to_string()];
+                let mut x = rr.left();
+                for (c, ((_, w, num), v)) in cols.iter().zip(vals).enumerate() {
+                    let (pos, al) = if *num { (pos2(x + w - 6.0, rr.center().y), Align2::RIGHT_CENTER) } else { (pos2(x + 6.0, rr.center().y), Align2::LEFT_CENTER) };
+                    text(ui.painter(), pos, al, &v, font(12.0), if c == 0 { TEXT } else { MUTED }, w - 12.0);
+                    x += w;
+                }
+            }
+        });
+        if let Some(id) = clicked {
+            self.sel = Some(Hit::Dir(id));
+        }
+        if let Some(id) = open {
+            self.space_enter(id, now);
+        }
+    }
+
     fn selbar(&mut self, ui: &mut Ui, r: Rect, now: f64) {
         ui.painter().rect_filled(r, 10.0, CARD);
+        if self.space.is_some() {
+            self.space_selbar(ui, r, now);
+            return;
+        }
         let qs = self.selected();
         let k = self.cpu_scale();
         let (msg, c) = match (qs.first(), &self.sel) {
@@ -1419,7 +2027,11 @@ impl App {
         }
     }
 
-    fn table(&mut self, ui: &mut Ui, r: Rect, _now: f64) {
+    fn table(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        if self.space.is_some() {
+            self.space_table(ui, r, now);
+            return;
+        }
         let mut tu = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Min)));
         tu.horizontal(|ui| {
             let fr = egui::Frame::new().fill(CARD).corner_radius(10.0).inner_margin(egui::Margin::symmetric(10, 8));
@@ -1444,7 +2056,7 @@ impl App {
             let cr = Rect::from_min_size(pos2(col_x(i), hr.top()), vec2(w, 22.0));
             let resp = tu.interact(cr, Id::unique(("head", i)), Sense::click());
             let on = self.sort.0 == *col;
-            let mut l = if *col == Col::Cpu && self.per_core { "CPU/core".to_string() } else { label.to_string() };
+            let mut l = label.to_string();
             if on {
                 l += if self.sort.1 { " ↓" } else { " ↑" };
             }
@@ -1483,7 +2095,10 @@ impl App {
                     fmt_bytes(q.private),
                     if q.gpu_mem > 0.0 { fmt_bytes(q.gpu_mem) } else if pdh { "-".into() } else { "n/a".into() },
                     if q.gpu >= 0.5 { format!("{:.0}%", q.gpu) } else { "-".into() },
-                    if q.io >= 102400.0 { fmt_rate(q.io) } else { "-".into() },
+                    if q.io_r >= 102400.0 { fmt_rate(q.io_r) } else { "-".into() },
+                    if q.io_w >= 102400.0 { fmt_rate(q.io_w) } else { "-".into() },
+                    if q.net_d >= 1024.0 { fmt_rate(q.net_d) } else { "-".into() },
+                    if q.net_u >= 1024.0 { fmt_rate(q.net_u) } else { "-".into() },
                     q.threads.to_string(),
                     sys::fmt_started(q.create),
                     q.cmd.clone(),
@@ -1639,4 +2254,5 @@ fn setup_style(ctx: &egui::Context) {
 
 fn main() {
     shell::run();
+    net::stop(); // a real-time trace session would outlive us
 }
