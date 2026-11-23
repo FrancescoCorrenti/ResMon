@@ -1,0 +1,4 @@
+flet==1.1.2
+psutil
+pywin32
+nvidia-ml-py
