@@ -107,8 +107,26 @@ async def measure_cpu(app, seconds, label):
 async def run(app):
     os.makedirs(OUT, exist_ok=True)
     open(os.path.join(OUT, "selftest.log"), "w").close()
-    app.page.enable_screenshots = True
     app.auto_hover = False  # the real cursor is not ours to move; transitions are called directly
+    if os.environ["RESMON_TEST"] == "perf":  # phases for an external RAM/GPU sampler; no screenshots on purpose
+        off = os.environ.get("RESMON_PERF_OFF", "").split(",")  # bisect: switch parts of the full view off
+        if "treemap" in off:
+            app.render_treemap = lambda *a, **k: None
+        if "table" in off:
+            app.render_table = lambda *a, **k: None
+        for g in list(app.G_full.values()) + list(app.G_panel.values()):
+            if "spark" in off:
+                g._curve = lambda *a: []
+            if "cores" in off:
+                g.set_cores = lambda pc: None
+        log(f"perf, off: {off}")
+        for phase, go, secs in (("tab", None, 10), ("full", app.to_full, 20), ("tab-after", app.to_tab, 15)):
+            if go:
+                await go()
+            log(f"phase {phase} at {time.time():.0f}")
+            await asyncio.sleep(secs)
+        appmod.hard_exit()
+    app.page.enable_screenshots = True
     if os.environ["RESMON_TEST"] == "dock":  # every way back to the tab, through the real window events
         def docked(label):
             b = appmod.window_bounds()

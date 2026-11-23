@@ -31,7 +31,9 @@ PANEL_W, PANEL_H = 264, 660     # hover panel
 FULL_W, FULL_H = 1440, 900      # full view (clamped to the work area)
 EASE = ft.AnimationCurve.EASE_OUT_CUBIC
 UI_ANIM = ft.Animation(280, EASE)        # shell transitions
-VALUE_ANIM = ft.Animation(450, EASE)     # bars: a bit shorter than FAST, so they settle between samples
+# bars jump to each new sample: an animation lasting most of FAST kept Flutter drawing at 60 fps all the time
+# (full view measured at 82% of the integrated GPU); without it a sample costs one frame
+VALUE_ANIM = None
 TILE_ANIM = ft.Animation(550, EASE)      # treemap tiles glide
 
 BG, CARD, LINE = "#0E1014", "#161920", "#232733"
@@ -324,10 +326,12 @@ class Tile:
             changed = True
             self.color = (color, t["header"])
             if t["header"]:  # a group frame: dark, its processes sit on top
-                v.gradient, v.bgcolor = None, mix(color, BG, 0.55)
+                v.bgcolor, v.border = mix(color, BG, 0.55), None
             else:
-                v.gradient = ft.LinearGradient(begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
-                                               colors=[mix(color, "#FFFFFF", 0.18), mix(color, BG, 0.3)])
+                # solid fill + a light top edge instead of a gradient: a gradient per tile made Flutter keep a
+                # texture per tile (full view measured at 2.7 GB RAM / 2.4 GB GPU memory, 440 MB without)
+                v.bgcolor = mix(color, "#FFFFFF", 0.05)
+                v.border = ft.Border.only(top=ft.BorderSide(1, mix(color, "#FFFFFF", 0.3)))
         return changed
 
     def _texts(self, t, value_text):
