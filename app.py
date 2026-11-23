@@ -9,6 +9,7 @@ import asyncio
 import ctypes
 import ctypes.wintypes as wt
 import datetime as dt
+import json
 import os
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from core import HEADER, HISTORY, Sampler, Sticky, smooth, treemap_model
 FAST, SLOW = 0.5, 1.5           # seconds: totals / processes
 REFLOW = 8.0                    # seconds: minimum time between two treemap reflows
 TAB_W, TAB_H = 26, 168          # docked tab (logical px)
+TAB_WIN_W = 160                 # window width while docked: above Windows' minimum; clipped to the tab
 PANEL_W, PANEL_H = 264, 660     # hover panel
 FULL_W, FULL_H = 1440, 900      # full view (clamped to the work area)
 EASE = ft.AnimationCurve.EASE_OUT_CUBIC
@@ -41,26 +43,60 @@ PALETTE = ["#3D7FD9", "#8C5BD6", "#D6508F", "#D99A2B", "#2FA57A", "#2AA6BF",
 METRICS = {"ws": ("RAM", "ws"), "priv": ("Private", "priv"), "cpu": ("CPU", "cpu"),
            "gpu_mem": ("VRAM", "gpu_mem"), "gpu": ("GPU", "gpu")}  # key -> (pill label, process field)
 
-# ---------------------------------------------------------------- Windows glue (DPI-aware, logical px)
+# ---------------------------------------------------------------- Windows glue (physical px, per monitor)
+# Monitors can have different scales (e.g. a 150% laptop next to a 100% screen), so every position is in
+# physical px and the window is placed natively: Flet's logical bounds are ambiguous across monitors.
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Win32 calls below return physical px
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware: Win32 calls are in physical px
 except OSError:
     pass
-_u32 = ctypes.windll.user32
-SCALE = _u32.GetDpiForSystem() / 96  # 1.25 on this PC; Flet window bounds are logical px
+_u32, _gdi = ctypes.windll.user32, ctypes.windll.gdi32
+_u32.MonitorFromPoint.restype = wt.HMONITOR
+_u32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+_gdi.CreateRectRgn.restype = wt.HRGN
+_u32.SetWindowRgn.argtypes = [wt.HWND, wt.HRGN, wt.BOOL]
+SETTINGS = os.path.join(os.environ.get("APPDATA", ""), "ResMon", "settings.json")
 
 
-def work_area():
-    """Primary monitor work area (taskbar excluded) in logical px: (left, top, right, bottom)."""
-    r = wt.RECT()
-    _u32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)  # SPI_GETWORKAREA
-    return r.left / SCALE, r.top / SCALE, r.right / SCALE, r.bottom / SCALE
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+
+def monitor_at(x, y):
+    """Work area (taskbar excluded) and scale of the monitor nearest to (x, y): (left, top, right, bottom, scale)."""
+    h = _u32.MonitorFromPoint(wt.POINT(round(x), round(y)), 2)  # MONITOR_DEFAULTTONEAREST
+    mi = _MonitorInfo(cbSize=ctypes.sizeof(_MonitorInfo))
+    _u32.GetMonitorInfoW(h, ctypes.byref(mi))
+    dx, dy = ctypes.c_uint(96), ctypes.c_uint(96)
+    ctypes.windll.shcore.GetDpiForMonitor(h, 0, ctypes.byref(dx), ctypes.byref(dy))  # MDT_EFFECTIVE_DPI
+    r = mi.rcWork
+    return r.left, r.top, r.right, r.bottom, dx.value / 96
+
+
+def load_anchor():
+    """Where the tab was last docked (a point on the right edge of a monitor), or the primary monitor's
+    right-centre if none was saved or that monitor is gone."""
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            x, y = json.load(f)["anchor"]
+        if _u32.MonitorFromPoint(wt.POINT(round(x), round(y)), 0):  # MONITOR_DEFAULTTONULL
+            return x, y
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    L, T, R, B, _ = monitor_at(0, 0)  # (0, 0) is always on the primary monitor
+    return R - 1, (T + B) / 2
+
+
+def save_anchor(anchor):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    with open(SETTINGS, "w", encoding="utf-8") as f:
+        json.dump({"anchor": [round(v) for v in anchor]}, f)
 
 
 def cursor_pos():
     p = wt.POINT()
     _u32.GetCursorPos(ctypes.byref(p))
-    return p.x / SCALE, p.y / SCALE
+    return p.x, p.y
 
 
 def _hwnd():
@@ -68,22 +104,42 @@ def _hwnd():
 
 
 def window_bounds():
-    """Real bounds of our window, logical px, or None."""
+    """Real bounds of our window, physical px, or None."""
     r = wt.RECT()
     h = _hwnd()
     if not h or not _u32.GetWindowRect(h, ctypes.byref(r)):
         return None
-    return r.left / SCALE, r.top / SCALE, (r.right - r.left) / SCALE, (r.bottom - r.top) / SCALE
+    return r.left, r.top, r.right - r.left, r.bottom - r.top
 
 
-def fix_tab_width(b):
-    """Windows keeps a minimum width on the Flutter window even when frameless. Dropping the caption and
-    thick-frame styles and re-applying the bounds natively gets it down to ~118 px (the rest hangs off-screen)."""
-    h, wb = _hwnd(), window_bounds()
-    if h and wb and abs(wb[2] - b[2]) > 2:
-        style = _u32.GetWindowLongW(h, -16)  # GWL_STYLE
+def place(b, clip=None):
+    """Move/resize the window natively (physical px). clip = (x, y, w, h) in window coordinates limits
+    drawing and clicks to that rect; None gives the whole window back."""
+    h = _hwnd()
+    if not h:
+        return
+    _u32.SetWindowPos(h, 0, *(round(v) for v in b), 0x0014)  # NOZORDER|NOACTIVATE
+    rgn = _gdi.CreateRectRgn(*(round(v) for v in (clip[0], clip[1], clip[0] + clip[2], clip[1] + clip[3]))) \
+        if clip else None
+    _u32.SetWindowRgn(h, rgn, True)  # the system owns rgn from here on
+
+
+def move_to(x, y):
+    h = _hwnd()
+    if h:
+        _u32.SetWindowPos(h, 0, round(x), round(y), 0, 0, 0x0001 | 0x0004 | 0x0010)  # NOSIZE|NOZORDER|NOACTIVATE
+
+
+def strip_frame():
+    """Windows keeps a minimum width on the Flutter window even when frameless; without the caption and
+    thick-frame styles it goes down to ~118 logical px. The tab region clips the rest away."""
+    h = _hwnd()
+    if not h:
+        return
+    style = _u32.GetWindowLongW(h, -16)  # GWL_STYLE
+    if style & (0x00C00000 | 0x00040000):
         _u32.SetWindowLongW(h, -16, style & ~(0x00C00000 | 0x00040000))
-        _u32.SetWindowPos(h, 0, *(round(v * SCALE) for v in b), 0x0014 | 0x0020)  # NOZORDER|NOACTIVATE|FRAMECHANGED
+        _u32.SetWindowPos(h, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020)  # FRAMECHANGED only
 
 
 def hard_exit():
@@ -349,8 +405,16 @@ class ResMon:
         w.prevent_close = True
         w.on_event = self.on_window_event
         p.on_keyboard_event = self.on_key
+        self.anchor = load_anchor()
+        self.clip = None  # window region while docked as a tab (see dock_tab)
+        self.busy_drag, self.tab_win_w = False, 0
         self.bounds = self.geometry("tab")
-        w.left, w.top, w.width, w.height = self.bounds
+        # first placement goes through Flet, which multiplies by the system scale when it shows the window;
+        # dividing by the same scale puts it right where it belongs, then it is placed natively
+        L, T, W, H = self.bounds
+        ww = TAB_WIN_W * monitor_at(*self.anchor)[4]  # the docked window, not just the tab (see dock_tab)
+        s = _u32.GetDpiForSystem() / 96
+        w.left, w.top, w.width, w.height = (round(v / s) for v in (L + W - ww, T, ww, H))
 
         ncores = psutil.cpu_count() or 1
 
@@ -508,7 +572,8 @@ class ResMon:
                          width=TAB_W, height=TAB_H, bgcolor="#F2222631",
                          border=ft.Border.all(1, "#3A4150"), padding=ft.Padding.only(left=3),
                          border_radius=ft.BorderRadius.only(top_left=12, bottom_left=12)),
-            on_tap=self.to_full, on_secondary_tap=self.to_panel, mouse_cursor=ft.MouseCursor.CLICK)
+            on_tap=self.to_full, on_secondary_tap=self.to_panel, on_pan_start=self.start_drag,
+            mouse_cursor=ft.MouseCursor.CLICK)
 
         # ---- hover panel: slides in from the right edge
         def foot(icon, tip, fn, color=MUTED):
@@ -535,7 +600,6 @@ class ResMon:
 
         # one root, always anchored at the right-centre: swapping faces never flashes at the left
         self.root = ft.Container(self.tab_view, expand=True, alignment=ft.Alignment.CENTER_RIGHT)
-        self.tab_pad = 0  # right padding that keeps the tab on screen (see pin_tab)
         p.add(self.root)
         self.render_crumb()
         self.paint_sort()
@@ -956,38 +1020,84 @@ class ResMon:
 
     # ------------------------------------------------------------ shell: tab <-> panel <-> full (one window)
     def geometry(self, mode):
-        L, T, R, B = work_area()
-        cy = (T + B) / 2
-        if mode == "tab":
-            return (R - TAB_W, cy - TAB_H / 2, TAB_W, TAB_H)
-        if mode == "panel":
-            h = min(PANEL_H, B - T)
-            return (R - PANEL_W, max(T, cy - h / 2), PANEL_W, h)
-        w, h = min(FULL_W, R - L - 12), min(FULL_H, B - T - 24)
-        return (R - w, cy - h / 2, w, h)  # flush with the right edge, like the tab it grows from
+        """Bounds in physical px on the anchor's monitor, flush with its right edge; tab and panel are
+        centred on the anchor's height, the full view on the monitor."""
+        L, T, R, B, s = monitor_at(*self.anchor)
+        if mode == "full":
+            w, h = min(FULL_W * s, R - L - 12 * s), min(FULL_H * s, B - T - 24 * s)
+            return (R - w, (T + B - h) / 2, w, h)
+        w, h = (TAB_W, TAB_H) if mode == "tab" else (PANEL_W, PANEL_H)
+        w, h = w * s, min(h * s, B - T)
+        return (R - w, min(max(self.anchor[1] - h / 2, T), B - h), w, h)
 
-    def pin_tab(self):
-        """Windows keeps a minimum width on the window that depends on the DPI scale; whatever it cannot
-        shrink hangs off the right edge. Pad the right-anchored tab back by that excess so it stays visible
-        at any scale. Returns the controls to update."""
-        fix_tab_width(self.bounds)
+    def dock_tab(self):
+        """Windows will not shrink the window below a minimum width (it depends on the scale): keep the window
+        flush with the edge at whatever width it has and clip it to the tab, so the excess neither shows nor
+        catches clicks. Cheap when nothing changed (called every fast tick)."""
+        strip_frame()
         wb = window_bounds()
-        extra = max(0, round(wb[2] - TAB_W)) if wb else 0
-        if extra == self.tab_pad:
-            return []
-        self.tab_pad = extra
-        self.root.padding = ft.Padding.only(right=extra)
-        return [self.root]
+        if not wb:
+            return
+        L, T, W, H = self.bounds
+        # never ask for less than Windows allows: a refused width grows rightwards, over the next monitor,
+        # whose different scale makes Flutter resize the window back and forth
+        ww = max(round(TAB_WIN_W * monitor_at(*self.anchor)[4]), self.tab_win_w)
+        target, clip = (L + W - ww, T, ww, H), (ww - W, 0, W, H)
+        if clip != self.clip or any(abs(a - b) > 1 for a, b in zip(wb, target)):
+            place(target, clip)
+            self.clip = clip
+            wb = window_bounds()
+            if wb and wb[2] > ww + 1:  # Windows insists on more: remember it, re-flush on the next tick
+                self.tab_win_w, self.clip = wb[2], None
 
     def set_bounds(self, b):
-        """Window bounds and the face change go out in one update: no intermediate frame."""
-        if self.tab_pad and self.mode != "tab":  # panel and full views fill the window: no tab padding
-            self.tab_pad = 0
-            self.root.padding = None
-        self.bounds = b
-        w = self.page.window
-        w.left, w.top, w.width, w.height = (round(v) for v in b)
-        self.page.update()
+        """Native placement on the anchor's monitor, then the face change."""
+        self.bounds, self.clip, self.tab_win_w = b, None, 0
+        if self.mode == "tab":
+            self.page.update()
+            self.dock_tab()
+        else:
+            place(b)
+            self.page.update()
+        # moving to a monitor with another scale makes Flutter resize the window to its DPI suggestion:
+        # place it again once that has happened
+        self.page.run_task(self._settle, b)
+
+    async def _settle(self, b):
+        await asyncio.sleep(0.15)
+        if self.bounds == b and not self.busy_drag:
+            wb = window_bounds()
+            if wb and self.mode != "tab" and any(abs(x - y) > 1 for x, y in zip(wb, b)):
+                place(b)
+            elif self.mode == "tab":
+                self.clip = None
+                self.dock_tab()
+
+    def start_drag(self, e):
+        if self.mode == "tab" and not self.busy:
+            self.page.run_task(self.drag)
+
+    async def drag(self):
+        """The tab follows the cursor while the button is held, then docks on the right edge of the monitor
+        it was dropped on, at that height. The spot is saved for the next start."""
+        self.busy = self.busy_drag = True
+        try:
+            while _u32.GetAsyncKeyState(0x01) & 0x8000:  # VK_LBUTTON
+                x, y = cursor_pos()
+                wb = window_bounds()
+                if wb and self.clip:  # keep the grabbed tab centred under the cursor
+                    move_to(x - self.clip[0] - self.clip[2] / 2, y - wb[3] / 2)
+                await asyncio.sleep(0.016)
+            x, y = cursor_pos()
+            R = monitor_at(x, y)[2]
+            self.anchor = (R - 1, y)
+            try:
+                save_anchor(self.anchor)
+            except OSError as ex:
+                self.toast(f"Cannot save the tab position: {ex}", True)
+            self.set_bounds(self.geometry("tab"))
+        finally:
+            self.busy = self.busy_drag = False
 
     async def to_panel(self, e=None):
         if self.busy or self.mode != "tab":
@@ -1013,13 +1123,14 @@ class ResMon:
         self.busy = True
         try:
             start, end = self.bounds, self.geometry("full")
+            s = monitor_at(*self.anchor)[4]  # bounds are physical px, the card is laid out in logical px
             self.mode = "full"
             self.full_inner.visible, self.full_inner.opacity = False, 0
-            self.card.width, self.card.height = start[2], start[3]  # card starts as big as the tab/panel...
+            self.card.width, self.card.height = start[2] / s, start[3] / s  # card starts as big as the tab/panel...
             self.root.content = self.card
             self.set_bounds(end)
             await asyncio.sleep(0.03)
-            self.card.width, self.card.height = end[2], end[3]  # ...and grows out of the right edge
+            self.card.width, self.card.height = end[2] / s, end[3] / s  # ...and grows out of the right edge
             self.page.update()
             procs = await asyncio.to_thread(self.sampler.sample_procs)  # sampled during the animation
             self.set_procs(procs)
@@ -1119,8 +1230,9 @@ class ResMon:
             t0 = time.perf_counter()
             self.tot = await asyncio.to_thread(self.sampler.sample_totals)
             if not self.busy:
-                pinned = self.pin_tab() if self.mode == "tab" else []
-                self.page.update(*pinned, *self.render_totals())
+                if self.mode == "tab":
+                    self.dock_tab()
+                self.page.update(*self.render_totals())
             await asyncio.sleep(max(0.05, FAST - (time.perf_counter() - t0)))
 
     async def slow_loop(self):
@@ -1164,7 +1276,16 @@ class ResMon:
 async def main(page: ft.Page):
     app = ResMon(page)
     page.update()
-    page.window.visible = True  # started hidden: the first frame shown is already the tab
+    # Flet applies its own (logical) bounds only once the window is visible, with a scale that depends on
+    # the monitor: show it transparent, let that settle, place it natively, then fade it in
+    page.window.opacity = 0
+    page.window.visible = True
+    page.update()
+    await asyncio.sleep(0.5)
+    app.set_bounds(app.geometry("tab"))
+    await asyncio.sleep(0.2)
+    app.dock_tab()
+    page.window.opacity = 1
     page.update()
     page.run_task(app.fast_loop)
     page.run_task(app.slow_loop)

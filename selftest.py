@@ -46,9 +46,9 @@ async def shot(app, name):
 
 
 def edge_box(width, height):
-    L, T, R, B = appmod.work_area()
-    cy, s = (T + B) / 2, appmod.SCALE
-    return (int((R - width) * s), int((cy - height / 2) * s), int(R * s), int((cy + height / 2) * s))
+    x, cy = appmod.load_anchor()  # physical px, on the monitor the tab is docked to
+    L, T, R, B, s = appmod.monitor_at(x, cy)
+    return (int(R - width * s), int(cy - height * s / 2), int(R), int(cy + height * s / 2))
 
 
 def edge_shot(name, width=330, height=760):
@@ -112,8 +112,8 @@ async def run(app):
     if os.environ["RESMON_TEST"] == "dock":  # every way back to the tab, through the real window events
         def docked(label):
             b = appmod.window_bounds()
-            L, T, R, B = appmod.work_area()
-            ok = app.mode == "tab" and b is not None and abs(b[0] + b[2] - R) < 3 and b[2] < 130
+            L, T, R, B, s = appmod.monitor_at(*app.anchor)
+            ok = app.mode == "tab" and b is not None and abs(b[0] + b[2] - R) < 3 and b[2] <= appmod.TAB_WIN_W * s + 2
             log(f"{label}: mode={app.mode} bounds=" + ("none" if b is None else "(%.0f, %.0f, %.0f x %.0f)" % b)
                 + f" -> {'OK' if ok else 'FAIL'}")
             return ok
@@ -180,7 +180,7 @@ async def run(app):
         appmod.hard_exit()
     dummy = subprocess.Popen([sys.executable, "-c", DUMMY], creationflags=subprocess.CREATE_NO_WINDOW)
     try:
-        log(f"work area {appmod.work_area()}, scale {appmod.SCALE}")
+        log(f"anchor {app.anchor}, monitor (work area + scale) {appmod.monitor_at(*app.anchor)}")
         await asyncio.sleep(3)
         edge_shot("tab.png", 200, 400)
         frames = []
