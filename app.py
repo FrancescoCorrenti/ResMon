@@ -535,6 +535,7 @@ class ResMon:
 
         # one root, always anchored at the right-centre: swapping faces never flashes at the left
         self.root = ft.Container(self.tab_view, expand=True, alignment=ft.Alignment.CENTER_RIGHT)
+        self.tab_pad = 0  # right padding that keeps the tab on screen (see pin_tab)
         p.add(self.root)
         self.render_crumb()
         self.paint_sort()
@@ -965,8 +966,24 @@ class ResMon:
         w, h = min(FULL_W, R - L - 12), min(FULL_H, B - T - 24)
         return (R - w, cy - h / 2, w, h)  # flush with the right edge, like the tab it grows from
 
+    def pin_tab(self):
+        """Windows keeps a minimum width on the window that depends on the DPI scale; whatever it cannot
+        shrink hangs off the right edge. Pad the right-anchored tab back by that excess so it stays visible
+        at any scale. Returns the controls to update."""
+        fix_tab_width(self.bounds)
+        wb = window_bounds()
+        extra = max(0, round(wb[2] - TAB_W)) if wb else 0
+        if extra == self.tab_pad:
+            return []
+        self.tab_pad = extra
+        self.root.padding = ft.Padding.only(right=extra)
+        return [self.root]
+
     def set_bounds(self, b):
         """Window bounds and the face change go out in one update: no intermediate frame."""
+        if self.tab_pad and self.mode != "tab":  # panel and full views fill the window: no tab padding
+            self.tab_pad = 0
+            self.root.padding = None
         self.bounds = b
         w = self.page.window
         w.left, w.top, w.width, w.height = (round(v) for v in b)
@@ -1102,9 +1119,8 @@ class ResMon:
             t0 = time.perf_counter()
             self.tot = await asyncio.to_thread(self.sampler.sample_totals)
             if not self.busy:
-                if self.mode == "tab":
-                    fix_tab_width(self.bounds)
-                self.page.update(*self.render_totals())
+                pinned = self.pin_tab() if self.mode == "tab" else []
+                self.page.update(*pinned, *self.render_totals())
             await asyncio.sleep(max(0.05, FAST - (time.perf_counter() - t0)))
 
     async def slow_loop(self):
