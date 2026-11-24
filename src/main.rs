@@ -390,6 +390,7 @@ struct App {
     query: String,
     rows: Vec<usize>,
     space: Option<SpaceView>, // Some: the treemap and table show disk space instead of processes
+    scans: HashMap<String, space::Scan>, // drives walked or walking, kept while another view is shown
     cores: Vec<(Vec<usize>, u8)>, // physical cores: their threads (logical processors) and efficiency class
     space_seen: u64,          // folders count at the last space layout, to relayout as the scan grows
     // misc
@@ -463,6 +464,7 @@ impl App {
             query: String::new(),
             rows: Vec::new(),
             space: None,
+            scans: HashMap::new(),
             cores: sys::core_topology(),
             space_seen: 0,
             toast: None,
@@ -543,7 +545,7 @@ impl App {
             let b = self.geometry(Mode::Tab);
             self.set_bounds(b, now);
             self.sh.lock().unwrap().want_procs = false;
-            self.space = None; // the folder tree can be tens of MB: docked, give it back
+            self.park_space(); // the walk goes on in the background and its map is kept
         }
         self.trans = None;
     }
@@ -678,13 +680,24 @@ impl App {
     fn open_space(&mut self, drive: &str, now: f64, ctx: &egui::Context) {
         let (used, total) = self.tot.as_ref().and_then(|t| t.drives.iter().find(|d| d.0 == drive).map(|d| (d.1, d.2))).unwrap_or((0, 0));
         if self.space.as_ref().is_none_or(|s| s.scan.root != drive) {
-            let c = ctx.clone();
-            self.space = Some(SpaceView { scan: space::Scan::open(drive, move || c.request_repaint()), at: 0, used, total });
+            self.park_space();
+            let scan = self.scans.remove(drive).unwrap_or_else(|| {
+                let c = ctx.clone();
+                space::Scan::open(drive, move || c.request_repaint())
+            });
+            self.space = Some(SpaceView { scan, at: 0, used, total });
         } else if let Some(s) = &mut self.space {
             s.at = 0;
         }
         (self.sel, self.zoom, self.space_seen) = (None, None, 0);
         self.relayout(now);
+    }
+
+    /// Leave the drive map but keep its walk and its tree: reopening the drive shows them at once.
+    fn park_space(&mut self) {
+        if let Some(sv) = self.space.take() {
+            self.scans.insert(sv.scan.root.clone(), sv.scan);
+        }
     }
 
     fn space_enter(&mut self, id: u32, now: f64) {
@@ -1323,6 +1336,9 @@ impl App {
                 top: mx(&h.net_d, &h.net_u, 102400.0),
             },
         ));
+        if let (Some(a), Some(b)) = (v.iter().position(|e| e.0 == "disk"), v.iter().position(|e| e.0 == "net")) {
+            v.swap(a, b); // network first, then disk: the disk activity sits next to the drives
+        }
         v.retain(|(k, _)| self.cfg.shows(if *k == "commit" { "ram" } else { k })); // cards switched off in Settings
         v
     }
@@ -1607,7 +1623,8 @@ impl App {
             }
         }
         if let Some(m) = pick {
-            (self.metric, self.space) = (m, None);
+            self.metric = m;
+            self.park_space();
             let _ = self.save_settings(); // the view comes back as it was left
             self.relayout(now);
         }

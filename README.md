@@ -49,6 +49,10 @@ cd ResMon
 cargo build --release
 ```
 
+To run it as administrator without a UAC prompt each time (needed to end or reprioritise system
+processes and read their command lines), run `tools\install-admin.ps1` once from an elevated PowerShell:
+it registers a scheduled task with highest privileges and points the Desktop shortcut at it.
+
 Then run `target\release\resmon.exe` (no console window). Copy it anywhere you like: it is self-contained.
 To start it at logon, use the power button in the panel or **Start with Windows** in the `...` menu of the
 full view (it adds ResMon to your user's `Run` registry key). **Quit** is in the same places.

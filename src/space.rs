@@ -94,7 +94,8 @@ impl Scan {
     /// about twice a second while a walk runs.
     pub fn open(root: &str, tick: impl Fn() + Send + 'static) -> Scan {
         let cached = load(root);
-        let fresh = cached.is_none();
+        // no cache, or one saved half-way through a first walk: walk (again); the map shows what is known meanwhile
+        let fresh = cached.as_ref().is_none_or(|t| t.scanned_at.is_none());
         let tree = cached.unwrap_or_else(|| Tree {
             nodes: vec![Node { name: root.into(), parent: 0, files: 0, total: 0, children: Vec::new() }],
             running: false,
@@ -125,7 +126,7 @@ impl Scan {
         std::thread::spawn(move || {
             let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) }; // low I/O priority too
             let mut queue = VecDeque::from([0u32]);
-            let mut last_tick = Instant::now();
+            let (mut last_tick, mut last_save) = (Instant::now(), Instant::now());
             while let Some(id) = queue.pop_front() {
                 if stop.load(Ordering::Relaxed) {
                     t.lock().unwrap().running = false;
@@ -173,6 +174,12 @@ impl Scan {
                     g.version += 1;
                 }
                 drop(g);
+                if last_save.elapsed().as_secs() >= 60 {
+                    // a first walk takes minutes: keep what it found so far, the next open resumes from there
+                    last_save = Instant::now();
+                    let g = t.lock().unwrap();
+                    let _ = save(&root, &g);
+                }
                 if last_tick.elapsed().as_millis() > 500 {
                     last_tick = Instant::now();
                     tick();
@@ -284,7 +291,7 @@ fn load(root: &str) -> Option<Tree> {
     for n in &mut nodes {
         n.children.reverse();
     }
-    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: Some(scanned_at), took: Some(took), version: 1, started: Instant::now() })
+    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: (scanned_at > 0).then_some(scanned_at), took: Some(took), version: 1, started: Instant::now() })
 }
 
 #[cfg(test)]

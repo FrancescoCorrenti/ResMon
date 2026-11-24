@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 /// Cards of the full view / panel that can be switched off (DRIVES covers the per-drive cards).
 pub const CARDS: [(&str, &str); 7] =
-    [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("disk", "Disk activity"), ("net", "Network"), ("drives", "Drives")];
+    [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("net", "Network"), ("disk", "Disk activity"), ("drives", "Drives")];
 /// Measures the docked tab can show as bars.
-pub const TAB_BARS: [(&str, &str); 6] = [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("disk", "Disk"), ("net", "Network")];
+pub const TAB_BARS: [(&str, &str); 6] = [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("net", "Network"), ("disk", "Disk")];
 
 #[derive(Clone)]
 pub struct Settings {

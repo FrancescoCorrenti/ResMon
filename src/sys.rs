@@ -832,11 +832,16 @@ pub fn startup_enabled() -> bool {
     ok
 }
 
+use std::os::windows::process::CommandExt;
+
 pub fn set_startup(on: bool) -> Result<(), String> {
     let k = run_key(true).ok_or("cannot open the Run key")?;
     let r = if on {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let v: Vec<u8> = format!("\"{}\"", exe.display()).encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect();
+        // with the "ResMon" task (tools/install-admin.ps1) the logon start goes through it: elevated, no prompt
+        let task = std::process::Command::new("schtasks").args(["/query", "/tn", "ResMon"]).creation_flags(0x0800_0000).output().is_ok_and(|o| o.status.success());
+        let cmd = if task { r"schtasks.exe /run /tn ResMon".to_string() } else { format!("\"{}\"", exe.display()) };
+        let v: Vec<u8> = cmd.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect();
         unsafe { RegSetValueExW(k, &HSTRING::from("ResMon"), None, REG_SZ, Some(&v)) }
     } else {
         unsafe { RegDeleteValueW(k, &HSTRING::from("ResMon")) }
