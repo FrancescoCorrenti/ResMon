@@ -9,8 +9,10 @@
 mod net;
 mod raster;
 mod shell;
+mod settings;
 mod space;
 mod sys;
+mod theme;
 mod treemap;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,6 +24,7 @@ use egui::{
     vec2,
 };
 use sys::{Field, History, Proc, Totals};
+use theme::{ac, th};
 use treemap::{Hit, Key, Sticky, Tile};
 use windows::Win32::Foundation::HWND;
 
@@ -29,32 +32,12 @@ const REFLOW: f64 = 8.0; // seconds between two treemap reflows
 const TAB: Vec2 = vec2(34.0, 178.0); // docked tab (logical px): three bars with their icons
 const PANEL: Vec2 = vec2(264.0, 790.0); // hover panel
 const FULL: Vec2 = vec2(1440.0, 900.0); // full view (clamped to the work area)
-const HOVER_OPEN: f32 = 0.6; // seconds resting on the tab before the panel opens (dragging starts on a press, not on rest)
 const UI_ANIM: f64 = 0.28; // shell transitions
 const FADE: f64 = 0.22; // full view content fade
 const TILE_ANIM: f64 = 0.55; // treemap tiles glide
 const SPLIT_GAP: f32 = 10.0; // split view (disk read | write, network down | up): space between halves
 const SPLIT_CAPTION: f32 = 28.0; // and the caption band over each half
 
-// monochrome shell; colour is kept for data only (sparklines, bars, tiles)
-const BG: Color32 = Color32::from_rgb(0x0B, 0x0D, 0x11);
-const CARD: Color32 = Color32::from_rgb(0x13, 0x16, 0x1C);
-const LINE: Color32 = Color32::from_rgb(0x1F, 0x23, 0x2C);
-const SEL_BG: Color32 = Color32::from_rgb(0x1A, 0x1F, 0x29);
-const SEL_LINE: Color32 = Color32::from_rgb(0x4A, 0x54, 0x68);
-const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE8, 0xEE);
-const MUTED: Color32 = Color32::from_rgb(0x8B, 0x91, 0xA0);
-const FAINT: Color32 = Color32::from_rgb(0x56, 0x60, 0x70);
-const PILL_ON: Color32 = Color32::from_rgb(0x2A, 0x30, 0x40);
-const C_CPU: Color32 = Color32::from_rgb(0x6C, 0xB6, 0xF5);
-const C_RAM: Color32 = Color32::from_rgb(0xA9, 0x93, 0xE8);
-const C_COMMIT: Color32 = Color32::from_rgb(0x8A, 0x80, 0xC8);
-const C_GPU: Color32 = Color32::from_rgb(0x5C, 0xCB, 0x98);
-const C_VRAM: Color32 = Color32::from_rgb(0xE0, 0xBC, 0x62);
-const C_DISK: Color32 = Color32::from_rgb(0xE8, 0x95, 0x7A);
-const C_DISK2: Color32 = Color32::from_rgb(0xF2, 0xC7, 0xB6);
-const C_NET: Color32 = Color32::from_rgb(0x62, 0xC6, 0xD4);
-const C_NET2: Color32 = Color32::from_rgb(0xB6, 0xE6, 0xEC);
 const DANGER: Color32 = Color32::from_rgb(0xF0, 0x62, 0x72);
 // Segoe Fluent Icons glyphs
 const I_CPU: &str = "\u{EEA1}";
@@ -120,6 +103,26 @@ fn heat_color(cpu: f64) -> Color32 {
     // 0..~25% of the machine -> cold slate to hot orange, in 8 steps so tiles do not flicker
     let q = (cpu * 8.0 / 25.0).round() * 25.0 / 8.0;
     mix(rgb(0x2A3445), rgb(0xFF6A3D), ((q / 25.0).min(1.0) as f32).powf(0.6))
+}
+
+const FIELD_NAMES: [(Field, &str); 9] = [
+    (Field::Ws, "ws"),
+    (Field::Private, "priv"),
+    (Field::Cpu, "cpu"),
+    (Field::GpuMem, "vram"),
+    (Field::Gpu, "gpu"),
+    (Field::IoRead, "disk"),
+    (Field::IoWrite, "disk"),
+    (Field::NetDown, "net"),
+    (Field::NetUp, "net"),
+];
+
+fn field_name(f: Field) -> &'static str {
+    FIELD_NAMES.iter().find(|e| e.0 == f).map_or("ws", |e| e.1)
+}
+
+fn field_of(name: &str) -> Field {
+    FIELD_NAMES.iter().find(|e| e.1 == name).map_or(Field::Ws, |e| e.0)
 }
 
 fn ease(t: f64) -> f32 {
@@ -219,6 +222,7 @@ struct Shared {
     bounds: (i32, i32, i32, i32),
     busy: bool,
     hover_fire: bool,
+    hover: f32, // seconds resting on the tab before the panel opens (a setting)
 }
 
 fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
@@ -255,7 +259,7 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
             std::thread::sleep(Duration::from_millis(50));
         }
     });
-    // Cursor polling with hysteresis: rest on the tab for HOVER_OPEN -> panel; leave the panel for 0.4 s -> tab.
+    // Cursor polling with hysteresis: rest on the tab for the hover setting -> panel; leave the panel for 0.4 s -> tab.
     // Polling (not hover events) because a frameless window that resizes under the cursor misses exits.
     std::thread::spawn(move || {
         if std::env::var_os("RESMON_OPEN").is_some() {
@@ -264,9 +268,9 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
         let mut since: Option<Instant> = None;
         loop {
             std::thread::sleep(Duration::from_millis(80));
-            let (mode, (l, t, w, h), busy) = {
+            let (mode, (l, t, w, h), busy, hover_open) = {
                 let g = sh.lock().unwrap();
-                (g.mode, g.bounds, g.busy || g.hover_fire)
+                (g.mode, g.bounds, g.busy || g.hover_fire, g.hover)
             };
             if busy || mode == Mode::Full || sys::left_button_down() {
                 since = None; // a held button is a drag in the making, not a hover
@@ -280,7 +284,7 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
                 continue;
             }
             let s0 = *since.get_or_insert_with(Instant::now);
-            let need = if mode == Mode::Tab { HOVER_OPEN } else { 0.4 };
+            let need = if mode == Mode::Tab { hover_open } else { 0.4 };
             if s0.elapsed().as_secs_f32() >= need {
                 since = None;
                 sh.lock().unwrap().hover_fire = true;
@@ -394,12 +398,17 @@ struct App {
     startup: bool,
     users: HashMap<u32, String>,
     quit: bool,
+    table_open: bool,    // the process list under the map
+    settings_open: bool, // the settings sheet over the full view
+    cfg: settings::Settings,
 }
 
 impl App {
     fn new(ctx: &egui::Context, hwnd: HWND) -> App {
         setup_style(ctx);
-        let anchor = sys::load_anchor().unwrap_or_else(|| {
+        let cfg = settings::Settings::load();
+        theme::set(&cfg.theme, &cfg.accents);
+        let anchor = cfg.anchor.unwrap_or_else(|| {
             let (_, t, r, b, _) = sys::monitor_at(0, 0); // (0, 0) is always on the primary monitor
             (r - 1, (t + b) / 2)
         });
@@ -416,6 +425,7 @@ impl App {
             bounds: (0, 0, 0, 0),
             busy: true,
             hover_fire: false,
+            hover: cfg.hover,
         }));
         spawn_threads(sh.clone(), ctx.clone());
         App {
@@ -435,10 +445,10 @@ impl App {
             procs: Arc::new(Vec::new()),
             by_pid: HashMap::new(),
             groups: HashMap::new(),
-            metric: Field::Ws,
-            heat: false,
-            relative: false,
-            per_core: false,
+            metric: field_of(&cfg.metric),
+            heat: cfg.heat,
+            relative: cfg.relative,
+            per_core: cfg.per_core,
             zoom: None,
             sel: None,
             hover: None,
@@ -460,6 +470,9 @@ impl App {
             startup: sys::startup_enabled(),
             users: HashMap::new(),
             quit: false,
+            table_open: cfg.table_open,
+            settings_open: false,
+            cfg,
         }
     }
 
@@ -476,7 +489,7 @@ impl App {
                 (w, h, (t + b - h) / 2.0)
             }
             _ => {
-                let v = if mode == Mode::Tab { TAB } else { PANEL };
+                let v = if mode == Mode::Tab { self.tab_size() } else { PANEL };
                 let (w, h) = (v.x * s, (v.y * s).min(b - t));
                 (w, h, (self.anchor.1 as f32 - h / 2.0).clamp(t, b - h))
             }
@@ -494,7 +507,7 @@ impl App {
 
     fn face_size(&self, mode: Mode) -> Vec2 {
         match mode {
-            Mode::Tab => TAB,
+            Mode::Tab => self.tab_size(),
             Mode::Panel => PANEL,
             Mode::Full => FULL,
         }
@@ -562,6 +575,7 @@ impl App {
         g.mode = self.mode;
         g.bounds = self.bounds;
         g.busy = self.trans.is_some() || self.drag || !self.shown;
+        g.hover = self.cfg.hover;
         g.want_split = self.mode == Mode::Full && self.per_core && self.metric == Field::Cpu && self.space.is_none();
     }
 
@@ -649,7 +663,7 @@ impl App {
         }
         if sv.at == 0 {
             let missing = sv.used.saturating_sub(g.nodes[0].total);
-            if !g.done && missing > 0 {
+            if g.scanned_at.is_none() && missing > 0 {
                 items.push(treemap::Item { key: Key::Part("Not scanned yet"), hit: None, title: "Not scanned yet".into(), value: missing as f64, free: true, children: Vec::new() });
             }
             if self.relative {
@@ -665,7 +679,7 @@ impl App {
         let (used, total) = self.tot.as_ref().and_then(|t| t.drives.iter().find(|d| d.0 == drive).map(|d| (d.1, d.2))).unwrap_or((0, 0));
         if self.space.as_ref().is_none_or(|s| s.scan.root != drive) {
             let c = ctx.clone();
-            self.space = Some(SpaceView { scan: space::Scan::start(drive, move || c.request_repaint()), at: 0, used, total });
+            self.space = Some(SpaceView { scan: space::Scan::open(drive, move || c.request_repaint()), at: 0, used, total });
         } else if let Some(s) = &mut self.space {
             s.at = 0;
         }
@@ -687,8 +701,7 @@ impl App {
     /// The scan moved on: lay the map out again (with a glide), at most once a second.
     fn space_tick(&mut self, now: f64) {
         let Some(s) = &self.space else { return };
-        let n = s.scan.tree.lock().unwrap().folders as u64;
-        let n = n * 2 + s.scan.tree.lock().unwrap().done as u64; // the end of the scan also changes the map
+        let n = s.scan.tree.lock().unwrap().version; // bumps on every change the walk makes
         if n != self.space_seen && now - self.last_reflow >= 1.0 {
             self.space_seen = n;
             let m = self.layout();
@@ -699,6 +712,9 @@ impl App {
 
     /// Disk and network are shown as one split view: (left, right) measures.
     fn split_fields(&self) -> Option<(Field, Field)> {
+        if self.space.is_some() {
+            return None; // the drive map has its own header: no read/write or down/up captions
+        }
         match self.metric {
             Field::IoRead | Field::IoWrite => Some((Field::IoRead, Field::IoWrite)),
             Field::NetDown | Field::NetUp => Some((Field::NetDown, Field::NetUp)),
@@ -806,12 +822,12 @@ impl App {
     fn tile_color(&self, t: &Tile) -> Color32 {
         if t.free {
             return match t.name.as_str() {
-                "Other" | "Files" => rgb(0x1C2029),
-                "Not scanned yet" => rgb(0x191C24),
-                _ => rgb(0x15181F),
+                "Other" | "Files" => th().raised,
+                "Not scanned yet" => th().unscanned,
+                _ => th().free,
             };
         }
-        if self.heat { heat_color(t.cpu) } else { mix(app_color(&t.name), BG, 0.25) }
+        if self.heat { heat_color(t.cpu) } else { mix(app_color(&t.name), th().bg, 0.25) }
     }
 
     fn selected(&self) -> Vec<&Proc> {
@@ -979,6 +995,14 @@ impl App {
         }
     }
 
+    /// Copy the remembered choices into the settings file.
+    fn save_settings(&mut self) -> std::io::Result<()> {
+        let c = &mut self.cfg;
+        (c.anchor, c.metric, c.heat, c.relative, c.per_core, c.table_open) =
+            (Some(self.anchor), field_name(self.metric).into(), self.heat, self.relative, self.per_core, self.table_open);
+        c.save()
+    }
+
     fn toggle_startup(&mut self, now: f64) {
         if let Err(e) = sys::set_startup(!self.startup) {
             self.toast(format!("Cannot change start with Windows: {e}"), true, now);
@@ -1003,7 +1027,7 @@ struct Gauge<'a> {
 }
 
 fn card(p: &egui::Painter, r: Rect, selected: bool) {
-    p.rect(r, 12.0, if selected { SEL_BG } else { CARD }, Stroke::new(1.0, if selected { SEL_LINE } else { CARD }), StrokeKind::Inside);
+    p.rect(r, 12.0, if selected { th().sel_bg } else { th().card }, Stroke::new(1.0, if selected { th().sel_line } else { th().card }), StrokeKind::Inside);
 }
 
 fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
@@ -1011,14 +1035,14 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
     card(&p, r, selected);
     let inner = Rect::from_min_max(r.min + vec2(12.0, if small { 8.0 } else { 10.0 }), r.max - vec2(12.0, if small { 6.0 } else { 8.0 }));
     let w = inner.width();
-    let tc = if selected { TEXT } else { MUTED };
+    let tc = if selected { th().text } else { th().muted };
     let mut y = inner.top();
     // the icon in the card's colour, then the label
-    let ic = if selected { g.s1.1 } else { mix(g.s1.1, MUTED, 0.35) };
+    let ic = if selected { g.s1.1 } else { mix(g.s1.1, th().muted, 0.35) };
     if small {
         p.text(pos2(inner.left(), y + 9.0), Align2::LEFT_CENTER, g.icon, icons(12.0), ic);
         text(&p, pos2(inner.left() + 18.0, y + 9.0), Align2::LEFT_CENTER, &g.title, bold(10.0), tc, w * 0.5);
-        let vr = text(&p, pos2(inner.right(), y + 9.0), Align2::RIGHT_CENTER, &g.value, bold(15.0), TEXT, w * 0.6);
+        let vr = text(&p, pos2(inner.right(), y + 9.0), Align2::RIGHT_CENTER, &g.value, bold(15.0), th().text, w * 0.6);
         if !g.vi.is_empty() {
             p.text(pos2(vr.left() - 5.0, y + 9.0), Align2::RIGHT_CENTER, g.vi, icons(12.0), g.s1.1);
         }
@@ -1031,7 +1055,7 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
         if !g.vi.is_empty() {
             p.text(pos2(inner.left(), y + 13.0), Align2::LEFT_CENTER, g.vi, icons(15.0), g.s1.1);
         }
-        text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.value, bold(20.0), TEXT, w - dx);
+        text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.value, bold(((w - dx) / 7.0).clamp(13.0, 20.0)), th().text, w - dx);
         y += 28.0;
     }
     match g.cores {
@@ -1041,7 +1065,7 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
             for (i, &v) in cores.iter().enumerate() {
                 // values jump to each sample: easing them kept the CPU renderer at ~40 fps (half a core)
                 let tr = Rect::from_min_size(pos2(inner.left() + i as f32 * (bw + 3.0), y + 1.0), vec2(bw, 12.0));
-                p.rect_filled(tr, 2.0, LINE);
+                p.rect_filled(tr, 2.0, th().line);
                 let fh = (v / 100.0).clamp(0.1, 1.0) * 12.0;
                 p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 2.0, g.s1.1);
             }
@@ -1051,7 +1075,7 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
             if let (false, Some((_, c2))) = (g.si.is_empty(), g.s2) {
                 p.text(pos2(inner.left() + 1.0, y + 7.0), Align2::LEFT_CENTER, g.si, icons(11.0), c2);
             }
-            text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.sub, font(11.0), MUTED, w - dx);
+            text(&p, pos2(inner.left() + dx, y), Align2::LEFT_TOP, &g.sub, font(11.0), th().muted, w - dx);
         }
     }
     y += 17.0;
@@ -1117,12 +1141,35 @@ fn split_by_cpu(procs: &[Proc], loads: &[f32]) -> Vec<Vec<(usize, f32)>> {
     out
 }
 
+/// One drive in the full view: name, free space, a used-space bar, and its read / write rates.
+fn draw_drive_card(ui: &Ui, r: Rect, mount: &str, used: u64, total: u64, rd: f64, wr: f64, selected: bool) {
+    let p = ui.painter().with_clip_rect(r);
+    card(&p, r, selected);
+    let inner = Rect::from_min_max(r.min + vec2(12.0, 10.0), r.max - vec2(12.0, 8.0));
+    let w = inner.width();
+    let ic = if selected { th().text } else { th().muted };
+    p.text(pos2(inner.left(), inner.top() + 6.0), Align2::LEFT_CENTER, I_DISK, icons(12.0), ic);
+    text(&p, pos2(inner.left() + 18.0, inner.top()), Align2::LEFT_TOP, &format!("DRIVE {mount}"), bold(10.0), ic, w - 18.0);
+    let f = if total > 0 { used as f32 / total as f32 } else { 0.0 };
+    text(&p, pos2(inner.left(), inner.top() + 16.0), Align2::LEFT_TOP, &format!("{} free", fmt_bytes(total.saturating_sub(used) as f64)), bold((w / 7.5).clamp(13.0, 20.0)), th().text, w);
+    text(&p, pos2(inner.left(), inner.top() + 44.0), Align2::LEFT_TOP, &format!("of {}  ·  {:.0}% used", fmt_bytes(total as f64), f * 100.0), font(11.0), th().muted, w);
+    let bar = Rect::from_min_size(pos2(inner.left(), inner.top() + 62.0), vec2(w, 5.0));
+    p.rect_filled(bar, 2.5, th().line);
+    p.rect_filled(Rect::from_min_size(bar.min, vec2(w * f, 5.0)), 2.5, if f > 0.9 { DANGER } else { ac().disk });
+    let y = inner.bottom() - 7.0;
+    p.text(pos2(inner.left(), y), Align2::LEFT_CENTER, I_READ, icons(11.0), ac().disk);
+    let t = text(&p, pos2(inner.left() + 16.0, y), Align2::LEFT_CENTER, &fmt_rate(rd), font(11.0), th().muted, w / 2.0 - 16.0);
+    let x = (t.right() + 10.0).max(inner.left() + w / 2.0);
+    p.text(pos2(x, y), Align2::LEFT_CENTER, I_WRITE, icons(11.0), ac().disk2);
+    text(&p, pos2(x + 16.0, y), Align2::LEFT_CENTER, &fmt_rate(wr), font(11.0), th().muted, inner.right() - x - 16.0);
+}
+
 /// Space per volume. Returns each row's rect (the full view opens a drive's space map on click).
 fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool, selected: Option<&str>) -> Vec<(String, Rect)> {
     let p = ui.painter().with_clip_rect(r);
     card(&p, r, selected.is_some());
     let inner = r.shrink2(vec2(12.0, 9.0));
-    let ic = if selected.is_some() { TEXT } else { MUTED };
+    let ic = if selected.is_some() { th().text } else { th().muted };
     p.text(pos2(inner.left(), inner.top() + 6.0), Align2::LEFT_CENTER, I_DRIVES, icons(12.0), ic);
     let title = if small { "DRIVES" } else { "DRIVES · click for folders" };
     text(&p, inner.left_top() + vec2(18.0, 0.0), Align2::LEFT_TOP, if selected.is_some() { "DRIVES · FOLDERS" } else { title }, bold(10.0), ic, inner.width() - 18.0);
@@ -1133,15 +1180,15 @@ fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool, sel
         let cy = y + 6.0;
         rows.push((mount.clone(), Rect::from_min_max(pos2(r.left(), cy - step / 2.0), pos2(r.right(), cy + step / 2.0))));
         if selected == Some(mount.as_str()) {
-            p.rect_filled(Rect::from_min_max(pos2(inner.left() - 6.0, cy - step / 2.0), pos2(inner.right() + 6.0, cy + step / 2.0)), 5.0, PILL_ON);
+            p.rect_filled(Rect::from_min_max(pos2(inner.left() - 6.0, cy - step / 2.0), pos2(inner.right() + 6.0, cy + step / 2.0)), 5.0, th().pill_on);
         }
-        text(&p, pos2(inner.left(), cy), Align2::LEFT_CENTER, mount, font(11.0), TEXT, 24.0);
+        text(&p, pos2(inner.left(), cy), Align2::LEFT_CENTER, mount, font(11.0), th().text, 24.0);
         let free = format!("{} free", fmt_bytes((total - used) as f64));
-        let fr = text(&p, pos2(inner.right(), cy), Align2::RIGHT_CENTER, &free, font(11.0), MUTED, 90.0);
+        let fr = text(&p, pos2(inner.right(), cy), Align2::RIGHT_CENTER, &free, font(11.0), th().muted, 90.0);
         let bar = Rect::from_min_max(pos2(inner.left() + 28.0, cy - 2.0), pos2(fr.left() - 8.0, cy + 2.0));
-        p.rect_filled(bar, 2.0, LINE);
+        p.rect_filled(bar, 2.0, th().line);
         let f = if *total > 0 { *used as f32 / *total as f32 } else { 0.0 };
-        p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 4.0)), 2.0, if f > 0.9 { DANGER } else { MUTED });
+        p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 4.0)), 2.0, if f > 0.9 { DANGER } else { th().muted });
         y += step;
     }
     rows
@@ -1152,7 +1199,7 @@ fn link(ui: &mut Ui, label: &str, color: Color32, size: f32) -> egui::Response {
     let g = ui.painter().layout_no_wrap(label.into(), font(size), color);
     let (r, resp) = ui.allocate_exact_size(g.size() + vec2(20.0, 10.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, 6.0, alpha(TEXT, 14));
+        ui.painter().rect_filled(r, 6.0, alpha(th().text, 14));
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     ui.painter().galley(r.center() - g.size() / 2.0, g, color);
@@ -1162,7 +1209,7 @@ fn link(ui: &mut Ui, label: &str, color: Color32, size: f32) -> egui::Response {
 fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, color: Color32) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(r, 8.0, alpha(TEXT, 16));
+        ui.painter().rect_filled(r, 8.0, alpha(th().text, 16));
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, icons(14.0), color);
@@ -1171,21 +1218,21 @@ fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, color: Color32) -> egui::Res
 
 /// Segmented pills; returns the index clicked.
 fn pills(ui: &mut Ui, items: &[(&str, bool)]) -> Option<usize> {
-    let gs: Vec<_> = items.iter().map(|(l, on)| ui.painter().layout_no_wrap(l.to_string(), font(12.0), if *on { TEXT } else { MUTED })).collect();
+    let gs: Vec<_> = items.iter().map(|(l, on)| ui.painter().layout_no_wrap(l.to_string(), font(12.0), if *on { th().text } else { th().muted })).collect();
     let w: f32 = gs.iter().map(|g| g.size().x + 20.0).sum::<f32>() + 2.0 * (gs.len() - 1) as f32 + 6.0;
     let (r, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
-    ui.painter().rect_filled(r, 10.0, CARD);
+    ui.painter().rect_filled(r, 10.0, th().card);
     let mut x = r.left() + 3.0;
     let mut hit = None;
     for (i, g) in gs.into_iter().enumerate() {
         let pr = Rect::from_min_size(pos2(x, r.top() + 3.0), vec2(g.size().x + 20.0, 24.0));
         let resp = ui.interact(pr, ui.scope_id().with(("pill", items[i].0)), Sense::click());
         let bg = ui.ctx().animate_bool_with_time(resp.id.with("on"), items[i].1, 0.2);
-        ui.painter().rect_filled(pr, 8.0, alpha(PILL_ON, (bg * 255.0) as u8));
+        ui.painter().rect_filled(pr, 8.0, alpha(th().pill_on, (bg * 255.0) as u8));
         if resp.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
-        ui.painter().galley(pr.center() - g.size() / 2.0, g, TEXT);
+        ui.painter().galley(pr.center() - g.size() / 2.0, g, th().text);
         if resp.clicked() {
             hit = Some(i);
         }
@@ -1200,7 +1247,7 @@ impl App {
         let h = &self.hist;
         let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
         let mut v = vec![
-            ("cpu", Gauge { icon: I_CPU, vi: "", si: "", title: "CPU".into(), value: format!("{:.0}%", s.cpu), sub: String::new(), cores: Some(&s.per_core), s1: (&h.cpu, C_CPU), s2: None, top: 100.0 }),
+            ("cpu", Gauge { icon: I_CPU, vi: "", si: "", title: "CPU".into(), value: format!("{:.0}%", s.cpu), sub: String::new(), cores: Some(&s.per_core), s1: (&h.cpu, ac().cpu), s2: None, top: 100.0 }),
             (
                 "ram",
                 Gauge {
@@ -1211,7 +1258,7 @@ impl App {
                     value: format!("{:.1} / {}", gb(s.ram_used), fmt_bytes(s.ram_total as f64)),
                     sub: format!("Commit {} of {}", fmt_bytes(s.commit as f64), fmt_bytes(s.commit_limit as f64)),
                     cores: None,
-                    s1: (&h.ram, C_RAM),
+                    s1: (&h.ram, ac().ram),
                     s2: None,
                     top: 100.0,
                 },
@@ -1228,7 +1275,7 @@ impl App {
                     value: format!("{:.1} / {}", gb(s.commit), fmt_bytes(s.commit_limit as f64)),
                     sub: format!("{:.0}% of the commit limit", s.commit as f64 / s.commit_limit.max(1) as f64 * 100.0),
                     cores: None,
-                    s1: (&h.commit, C_COMMIT),
+                    s1: (&h.commit, ac().commit),
                     s2: None,
                     top: 100.0,
                 },
@@ -1242,9 +1289,9 @@ impl App {
             }
             None => ("n/a".into(), s.gpu_err.clone().unwrap_or_else(|| "No NVIDIA GPU".into())),
         };
-        v.push(("gpu", Gauge { icon: I_GPU, vi: "", si: "", title: "GPU".into(), value: gv, sub: gs, cores: None, s1: (&h.gpu, C_GPU), s2: None, top: 100.0 }));
+        v.push(("gpu", Gauge { icon: I_GPU, vi: "", si: "", title: "GPU".into(), value: gv, sub: gs, cores: None, s1: (&h.gpu, ac().gpu), s2: None, top: 100.0 }));
         let (vv, vs) = if g.mem_total > 0 { (format!("{:.1} / {}", gb(g.mem_used), fmt_bytes(g.mem_total as f64)), g.name.replace("NVIDIA GeForce ", "")) } else { ("-".into(), String::new()) };
-        v.push(("vram", Gauge { icon: I_VRAM, vi: "", si: "", title: "VRAM".into(), value: vv, sub: vs, cores: None, s1: (&h.vram, C_VRAM), s2: None, top: 100.0 }));
+        v.push(("vram", Gauge { icon: I_VRAM, vi: "", si: "", title: "VRAM".into(), value: vv, sub: vs, cores: None, s1: (&h.vram, ac().vram), s2: None, top: 100.0 }));
         let mx = |a: &VecDeque<f32>, b: &VecDeque<f32>, floor: f32| a.iter().chain(b).fold(floor, |m, &x| m.max(x));
         v.push((
             "disk",
@@ -1256,8 +1303,8 @@ impl App {
                 vi: I_READ,
                 si: I_WRITE,
                 cores: None,
-                s1: (&h.disk_r, C_DISK),
-                s2: Some((&h.disk_w, C_DISK2)),
+                s1: (&h.disk_r, ac().disk),
+                s2: Some((&h.disk_w, ac().disk2)),
                 top: mx(&h.disk_r, &h.disk_w, 1048576.0),
             },
         ));
@@ -1271,30 +1318,57 @@ impl App {
                 vi: I_DOWN,
                 si: I_UP,
                 cores: None,
-                s1: (&h.net_d, C_NET),
-                s2: Some((&h.net_u, C_NET2)),
+                s1: (&h.net_d, ac().net),
+                s2: Some((&h.net_u, ac().net2)),
                 top: mx(&h.net_d, &h.net_u, 102400.0),
             },
         ));
+        v.retain(|(k, _)| self.cfg.shows(if *k == "commit" { "ram" } else { k })); // cards switched off in Settings
         v
+    }
+
+    /// The docked tab: as wide as its bars need.
+    fn tab_size(&self) -> Vec2 {
+        vec2(16.0 + 9.0 * self.cfg.tab.len().max(1) as f32, TAB.y)
+    }
+
+    /// (fill %, colour, icon) of each bar of the docked tab. Rates are against the peak of the last minute.
+    fn tab_bars(&self) -> Vec<(f32, Color32, &'static str)> {
+        let Some(s) = &self.tot else { return Vec::new() };
+        let h = &self.hist;
+        let peak = |a: &VecDeque<f32>, b: &VecDeque<f32>, floor: f32| a.iter().chain(b).fold(floor, |m, &x| m.max(x));
+        self.cfg
+            .tab
+            .iter()
+            .filter_map(|k| match k.as_str() {
+                "cpu" => Some((s.cpu, ac().cpu, I_CPU)),
+                "ram" => Some((s.ram_used as f32 / s.ram_total.max(1) as f32 * 100.0, ac().ram, I_RAM)),
+                "gpu" => Some((s.gpu.util.unwrap_or(0.0), ac().gpu, I_GPU)),
+                "vram" => Some((s.gpu.mem_used as f32 / s.gpu.mem_total.max(1) as f32 * 100.0, ac().vram, I_VRAM)),
+                "disk" => Some(((s.disk_r + s.disk_w) as f32 / peak(&h.disk_r, &h.disk_w, 1048576.0) * 100.0, ac().disk, I_DISK)),
+                "net" => Some(((s.net_d + s.net_u) as f32 / peak(&h.net_d, &h.net_u, 102400.0) * 100.0, ac().net, I_NET)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn draw_tab(&mut self, ui: &mut Ui, win: Rect, now: f64) {
         let ctx = ui.ctx().clone();
-        let r = Rect::from_min_size(pos2(win.right() - TAB.x, win.center().y - TAB.y / 2.0), TAB);
+        let tab = self.tab_size();
+        let r = Rect::from_min_size(pos2(win.right() - tab.x, win.center().y - tab.y / 2.0), tab);
         let p = ui.painter();
-        p.rect(r, CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 }, alpha(rgb(0x222631), 0xF2), Stroke::new(1.0, rgb(0x3A4150)), StrokeKind::Inside);
-        let vals = self.tot.as_ref().map_or([0.0; 3], |s| [s.cpu, s.ram_used as f32 / s.ram_total.max(1) as f32 * 100.0, s.gpu.util.unwrap_or(0.0)]);
-        // three bars, each with its icon underneath (CPU, memory, GPU)
-        let (top, bh, pitch) = (r.top() + 14.0, TAB.y - 44.0, 9.0);
-        let x0 = r.center().x + 1.5 - (2.0 * pitch + 4.0) / 2.0;
-        for (i, ((v, c), ic)) in vals.iter().zip([C_CPU, C_RAM, C_GPU]).zip([I_CPU, I_RAM, I_GPU]).enumerate() {
+        p.rect(r, CornerRadius { nw: 12, sw: 12, ne: 0, se: 0 }, alpha(th().tab_bg, 0xF2), Stroke::new(1.0, th().tab_line), StrokeKind::Inside);
+        // the bars chosen in Settings, each with its icon underneath
+        let bars = self.tab_bars();
+        let (top, bh, pitch) = (r.top() + 14.0, tab.y - 44.0, 9.0);
+        let x0 = r.center().x + 2.0 - (pitch * (bars.len() as f32 - 1.0) + 4.0) / 2.0;
+        for (i, (v, c, ic)) in bars.into_iter().enumerate() {
             // no easing here: the docked tab is always on screen, and an animation every 0.5 s kept it at ~36 fps (3% of a core)
             let tr = Rect::from_min_size(pos2(x0 + i as f32 * pitch, top), vec2(4.0, bh));
-            p.rect_filled(tr, 2.0, LINE);
+            p.rect_filled(tr, 2.0, th().line);
             let fh = (v / 100.0).clamp(0.02, 1.0) * bh;
             p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 2.0, c);
-            p.text(pos2(tr.center().x, tr.bottom() + 10.0), Align2::CENTER_CENTER, ic, icons(8.5), mix(c, MUTED, 0.25));
+            p.text(pos2(tr.center().x, tr.bottom() + 10.0), Align2::CENTER_CENTER, ic, icons(8.5), mix(c, th().muted, 0.25));
         }
         // hand on hover (it is a button); the move cursor only once it is held: a drag or a long press
         let resp = ui.interact(r, Id::unique("tab"), Sense::click_and_drag());
@@ -1314,7 +1388,7 @@ impl App {
             } else {
                 self.drag = false;
                 self.anchor = (sys::monitor_at(x, y).2 - 1, y);
-                if let Err(e) = sys::save_anchor(self.anchor) {
+                if let Err(e) = self.save_settings() {
                     self.toast(format!("Cannot save the tab position: {e}"), true, now);
                 }
                 let b = self.geometry(Mode::Tab);
@@ -1346,11 +1420,11 @@ impl App {
         let mut ui = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Min)));
         ui.set_clip_rect(win);
         let bg = ui.interact(r, Id::unique("panel"), Sense::click());
-        ui.painter().rect(r, CornerRadius { nw: 16, sw: 16, ne: 0, se: 0 }, alpha(rgb(0x0E1014), 0xF7), Stroke::new(1.0, LINE), StrokeKind::Inside);
+        ui.painter().rect(r, CornerRadius { nw: 16, sw: 16, ne: 0, se: 0 }, alpha(th().panel_bg, 0xF7), Stroke::new(1.0, th().line), StrokeKind::Inside);
         let inner = Rect::from_min_max(r.min + vec2(12.0, 10.0), r.max - vec2(10.0, 4.0));
         let pt = ui.painter().clone();
-        text(&pt, inner.left_top(), Align2::LEFT_TOP, "ResMon", bold(13.0), TEXT, 100.0);
-        text(&pt, pos2(inner.right(), inner.top() + 2.0), Align2::RIGHT_TOP, "click for details", font(10.0), FAINT, 120.0);
+        text(&pt, inner.left_top(), Align2::LEFT_TOP, "ResMon", bold(13.0), th().text, 100.0);
+        text(&pt, pos2(inner.right(), inner.top() + 2.0), Align2::RIGHT_TOP, "click for details", font(10.0), th().faint, 120.0);
         let gauges = self.gauges(true);
         let mut y = inner.top() + 26.0;
         for (_, g) in &gauges {
@@ -1364,16 +1438,16 @@ impl App {
         }
         let foot = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 34.0), inner.max);
         let mut fu = ui.new_child(UiBuilder::new().max_rect(foot).layout(Layout::left_to_right(Align::Center)));
-        if icon_button(&mut fu, "\u{E740}", "Open the full monitor", TEXT).clicked() {
+        if icon_button(&mut fu, "\u{E740}", "Open the full monitor", th().text).clicked() {
             self.go(Mode::Full, now);
             return;
         }
         fu.with_layout(Layout::right_to_left(Align::Center), |fu| {
-            if icon_button(fu, "\u{E8BB}", "Quit ResMon", MUTED).clicked() {
+            if icon_button(fu, "\u{E8BB}", "Quit ResMon", th().muted).clicked() {
                 self.quit = true;
             }
             let tip = format!("Start with Windows: {} (click to toggle)", if self.startup { "on" } else { "off" });
-            if icon_button(fu, "\u{E7E8}", &tip, if self.startup { C_GPU } else { MUTED }).clicked() {
+            if icon_button(fu, "\u{E7E8}", &tip, if self.startup { ac().gpu } else { th().muted }).clicked() {
                 self.toggle_startup(now);
             }
         });
@@ -1399,13 +1473,13 @@ impl App {
             None => (1.0, 1.0),
         };
         let from = match &self.trans {
-            Some(t) if t.to == Mode::Tab => TAB,
+            Some(t) if t.to == Mode::Tab => self.tab_size(),
             Some(t) => t.from,
             None => win.size(),
         };
         let size = from + (win.size() - from) * size_t;
         let card_r = Rect::from_min_size(pos2(win.right() - size.x, win.center().y - size.y / 2.0), size);
-        ui.painter().rect(card_r, CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, BG, Stroke::new(1.0, LINE), StrokeKind::Inside);
+        ui.painter().rect(card_r, CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 }, th().bg, Stroke::new(1.0, th().line), StrokeKind::Inside);
         if fade <= 0.0 {
             return;
         }
@@ -1418,14 +1492,22 @@ impl App {
         self.header(&ui, header, now);
         let tb = Rect::from_min_size(pos2(inner.left(), header.bottom() + 10.0), vec2(inner.width(), 30.0));
         self.toolbar(&mut ui, tb, now);
-        let rest = inner.bottom() - tb.bottom() - 10.0 - 40.0 - 20.0;
-        let tm = Rect::from_min_size(pos2(inner.left(), tb.bottom() + 10.0), vec2(inner.width(), (rest * 0.6).floor()));
+        // the process list can be folded away: the map takes its room, the selection bar stays
+        let rest = inner.bottom() - tb.bottom() - 10.0 - 40.0 - if self.table_open { 20.0 } else { 10.0 };
+        let tm_h = if self.table_open { (rest * 0.6).floor() } else { rest };
+        let tm = Rect::from_min_size(pos2(inner.left(), tb.bottom() + 10.0), vec2(inner.width(), tm_h));
         self.space_tick(now);
         self.treemap(&mut ui, tm, now);
         let sb = Rect::from_min_size(pos2(inner.left(), tm.bottom() + 10.0), vec2(inner.width(), 40.0));
         self.selbar(&mut ui, sb, now);
-        let table = Rect::from_min_max(pos2(inner.left(), sb.bottom() + 10.0), inner.max);
-        self.table(&mut ui, table, now);
+        if self.table_open {
+            let table = Rect::from_min_max(pos2(inner.left(), sb.bottom() + 10.0), inner.max);
+            self.table(&mut ui, table, now);
+        }
+        if self.settings_open {
+            let sheet = Rect::from_min_max(pos2(inner.right() - 380.0, header.top()), inner.max);
+            self.settings_sheet(&mut ui, sheet, now);
+        }
         self.kill_dialog(ui.ctx(), now);
         if let Some((msg, err, t0)) = &self.toast {
             let left = 4.0 - (now - t0);
@@ -1433,10 +1515,10 @@ impl App {
                 self.toast = None;
             } else {
                 let p = ui.painter();
-                let g = p.layout_no_wrap(msg.clone(), font(13.0), TEXT);
+                let g = p.layout_no_wrap(msg.clone(), font(13.0), th().text);
                 let r = Rect::from_center_size(pos2(card_r.center().x, card_r.bottom() - 40.0), g.size() + vec2(32.0, 20.0));
                 p.rect_filled(r, 10.0, if *err { rgb(0x3A1F25) } else { rgb(0x1F2A24) });
-                p.galley(r.center() - g.size() / 2.0, g, TEXT);
+                p.galley(r.center() - g.size() / 2.0, g, th().text);
                 ui.ctx().request_repaint_after(Duration::from_secs_f64(left));
             }
         }
@@ -1449,33 +1531,22 @@ impl App {
             ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
         }
         let p = ui.painter();
-        let t = text(p, pos2(bar.left() + 4.0, bar.center().y), Align2::LEFT_CENTER, "ResMon", bold(13.0), TEXT, 80.0);
-        text(p, pos2(t.right() + 8.0, bar.center().y), Align2::LEFT_CENTER, "drag to move · Esc to dock", font(11.0), FAINT, 300.0);
+        let t = text(p, pos2(bar.left() + 4.0, bar.center().y), Align2::LEFT_CENTER, "ResMon", bold(13.0), th().text, 80.0);
+        text(p, pos2(t.right() + 8.0, bar.center().y), Align2::LEFT_CENTER, "drag to move · Esc to dock", font(11.0), th().faint, 300.0);
         let mut bu = ui.new_child(UiBuilder::new().max_rect(bar).layout(Layout::right_to_left(Align::Center)));
-        if icon_button(&mut bu, "\u{E8BB}", "Dock to the edge", MUTED).clicked() || icon_button(&mut bu, "\u{E921}", "Dock to the edge", MUTED).clicked() {
+        if icon_button(&mut bu, "\u{E8BB}", "Dock to the edge", th().muted).clicked() || icon_button(&mut bu, "\u{E921}", "Dock to the edge", th().muted).clicked() {
             self.go(Mode::Tab, now);
         }
-        let startup = self.startup;
-        let mut toggle = false;
-        bu.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT; // the menu reads as an icon, like the two next to it
-        bu.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
-        bu.menu_button(egui::RichText::new("\u{E712}").font(icons(14.0)).color(MUTED), |ui| {
-            if ui.checkbox(&mut startup.clone(), "Start with Windows").clicked() {
-                toggle = true;
-                ui.close();
-            }
-            if ui.button("Quit ResMon").clicked() {
-                self.quit = true;
-            }
-        });
-        if toggle {
-            self.toggle_startup(now);
+        if icon_button(&mut bu, "\u{E713}", "Settings", if self.settings_open { th().text } else { th().muted }).clicked() {
+            self.settings_open = !self.settings_open;
         }
     }
 
     fn header(&mut self, ui: &Ui, r: Rect, now: f64) {
         let gauges = self.gauges(false);
-        let n = gauges.len() as f32 + 1.0;
+        // the measure cards, then one card per drive
+        let drives: Vec<(String, u64, u64)> = if self.cfg.shows("drives") { self.tot.as_ref().map(|t| t.drives.clone()).unwrap_or_default() } else { Vec::new() };
+        let n = (gauges.len() + drives.len()).max(1) as f32;
         let w = (r.width() - 10.0 * (n - 1.0)) / n;
         let mut pick = None;
         for (i, (key, g)) in gauges.iter().enumerate() {
@@ -1520,24 +1591,24 @@ impl App {
             }
         }
         let mut drive = None;
-        if let Some(s) = &self.tot {
-            let dr = Rect::from_min_size(pos2(r.right() - w, r.top()), vec2(w, r.height()));
-            let sel = self.space.as_ref().map(|s| s.scan.root.clone());
-            let rows = draw_drives(ui, dr, &s.drives, false, sel.as_deref());
-            let resp = ui.interact(dr, Id::unique("drives"), Sense::click()).on_hover_text("Click a drive to see what fills it, folder by folder");
+        let io = self.tot.as_ref().map(|t| t.drive_io.clone()).unwrap_or_default();
+        let open = self.space.as_ref().map(|s| s.scan.root.clone());
+        for (j, (mount, used, total)) in drives.iter().enumerate() {
+            let i = gauges.len() + j;
+            let dr = Rect::from_min_size(pos2(r.left() + i as f32 * (w + 10.0), r.top()), vec2(w, r.height()));
+            let (rd, wr) = io.iter().find(|d| &d.0 == mount).map_or((0.0, 0.0), |d| (d.1, d.2));
+            draw_drive_card(ui, dr, mount, *used, *total, rd, wr, open.as_deref() == Some(mount.as_str()));
+            let resp = ui.interact(dr, Id::unique(("drive", mount.as_str())), Sense::click()).on_hover_text(format!("{mount}: what fills it, folder by folder"));
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
             if resp.clicked() {
-                let at = resp.interact_pointer_pos().unwrap_or(dr.center());
-                drive = rows.iter().find(|(_, rr)| rr.contains(at)).or(rows.first()).map(|(m, _)| m.clone());
+                drive = Some(mount.clone());
             }
         }
         if let Some(m) = pick {
             (self.metric, self.space) = (m, None);
-            if m != Field::Cpu {
-                self.per_core = false; // per core only means something for CPU
-            }
+            let _ = self.save_settings(); // the view comes back as it was left
             self.relayout(now);
         }
         if let Some(d) = drive {
@@ -1552,13 +1623,13 @@ impl App {
             self.space_toolbar(&mut tu, now);
             return;
         }
-        if link(&mut tu, "All processes", if self.zoom.is_some() { MUTED } else { TEXT }, 14.0).clicked() && self.zoom.is_some() {
+        if link(&mut tu, "All processes", if self.zoom.is_some() { th().muted } else { th().text }, 14.0).clicked() && self.zoom.is_some() {
             self.zoom = None;
             self.relayout(now);
         }
         if let Some(z) = &self.zoom {
-            tu.label(egui::RichText::new("\u{E76C}").font(icons(11.0)).color(FAINT));
-            tu.label(egui::RichText::new(z.as_str()).font(bold(14.0)).color(TEXT));
+            tu.label(egui::RichText::new("\u{E76C}").font(icons(11.0)).color(th().faint));
+            tu.label(egui::RichText::new(z.as_str()).font(bold(14.0)).color(th().text));
         }
         let n = if self.zoom.is_some() { self.tiles.iter().filter(|t| t.hit.is_some()).count() } else { self.tiles.iter().filter(|t| t.hit.is_some()).map(|t| &t.name).collect::<HashSet<_>>().len() };
         let by = format!("Sized by {}{}", self.metric_label(), if self.whole().is_some() { " · share of total" } else { "" });
@@ -1571,24 +1642,30 @@ impl App {
             format!("{by}  ·  {n} apps · {} processes", self.procs.len())
         };
         tu.add_space(8.0);
-        tu.label(egui::RichText::new(count).font(font(12.0)).color(FAINT));
+        tu.label(egui::RichText::new(count).font(font(12.0)).color(th().faint));
         tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
             tu.spacing_mut().item_spacing.x = 8.0;
-            if let Some(i) = pills(tu, &[("App", !self.heat), ("CPU heat", self.heat)]) {
+            let cores_view = self.per_core && self.metric == Field::Cpu;
+            // only the buttons that mean something for this view
+            let glyph = if self.table_open { "\u{E70D}" } else { "\u{E70E}" }; // chevron down / up
+            if icon_button(tu, glyph, if self.table_open { "Hide the process list" } else { "Show the process list" }, th().muted).clicked() {
+                self.table_open = !self.table_open;
+                let _ = self.save_settings();
+            }
+            if !cores_view && let Some(i) = pills(tu, &[("App", !self.heat), ("CPU heat", self.heat)]) {
                 self.heat = i == 1;
+                let _ = self.save_settings();
             }
-            if self.metric == Field::Cpu {
-                // only CPU has cores to count against
-                if pills(tu, &[("Per core", self.per_core)]).is_some() {
-                    self.per_core = !self.per_core;
-                }
+            if self.metric == Field::Cpu && pills(tu, &[("Per core", self.per_core)]).is_some() {
+                self.per_core = !self.per_core;
+                let _ = self.save_settings();
             }
-            if !self.metric.is_rate() && !(self.per_core && self.metric == Field::Cpu) {
-                // rates have no total to share
-                if pills(tu, &[("Share of total", self.relative)]).is_some() {
-                    self.relative = !self.relative;
-                    self.relayout(now);
-                }
+            // a share of the machine only where the machine has a meaningful total for the processes to share
+            let shareable = matches!(self.metric, Field::Ws | Field::Private | Field::Gpu) || (self.metric == Field::Cpu && !cores_view);
+            if shareable && pills(tu, &[("Share of total", self.relative)]).is_some() {
+                self.relative = !self.relative;
+                let _ = self.save_settings();
+                self.relayout(now);
             }
         });
     }
@@ -1596,7 +1673,7 @@ impl App {
     /// Disk space map: the folder path as a breadcrumb, the scan's progress, Share of total (free space).
     fn space_toolbar(&mut self, tu: &mut Ui, now: f64) {
         let Some(sv) = &self.space else { return };
-        let (chain, status) = {
+        let (chain, status, running) = {
             let g = sv.scan.tree.lock().unwrap();
             let mut chain = vec![sv.at];
             while *chain.last().unwrap() != 0 {
@@ -1606,31 +1683,57 @@ impl App {
             let chain: Vec<(u32, String)> = chain.into_iter().map(|id| (id, g.nodes[id as usize].name.to_string())).collect();
             let found = fmt_bytes(g.nodes[0].total as f64);
             let denied = if g.denied > 0 { format!(" · {} folders not readable", g.denied) } else { String::new() };
-            let status = match g.took {
-                Some(t) => format!("{} folders, {found} in files · scanned in {:.0} s{denied}", g.folders, t),
-                None => format!("Scanning… {} folders, {found} of {} used{denied}", g.folders, fmt_bytes(sv.used as f64)),
+            let status = match (g.running, g.scanned_at) {
+                (true, None) => format!("Scanning… {} folders, {found} of {} used{denied}", g.checked, fmt_bytes(sv.used as f64)),
+                (true, Some(_)) => format!("Updating… {} folders checked{denied}", g.checked),
+                (false, Some(at)) => {
+                    let ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()).saturating_sub(at);
+                    let ago = match ago {
+                        0..120 => "just now".to_string(),
+                        120..7200 => format!("{} min ago", ago / 60),
+                        7200..172800 => format!("{} h ago", ago / 3600),
+                        _ => format!("{} days ago", ago / 86400),
+                    };
+                    format!("{found} in files · scanned {ago}{denied}")
+                }
+                (false, None) => String::new(),
             };
-            (chain, status)
+            (chain, status, g.running)
         };
         let mut go = None;
         let last = chain.len() - 1;
         for (i, (id, name)) in chain.iter().enumerate() {
             if i > 0 {
-                tu.label(egui::RichText::new("\u{E76C}").font(icons(11.0)).color(FAINT));
+                tu.label(egui::RichText::new("\u{E76C}").font(icons(11.0)).color(th().faint));
             }
-            if link(tu, name, if i == last { TEXT } else { MUTED }, 14.0).clicked() && i != last {
+            if link(tu, name, if i == last { th().text } else { th().muted }, 14.0).clicked() && i != last {
                 go = Some(*id);
             }
         }
         tu.add_space(8.0);
-        tu.label(egui::RichText::new(status).font(font(12.0)).color(FAINT));
+        tu.label(egui::RichText::new(status).font(font(12.0)).color(th().faint));
+        let mut refresh = false;
         tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
             tu.spacing_mut().item_spacing.x = 8.0;
+            let glyph = if self.table_open { "\u{E70D}" } else { "\u{E70E}" };
+            if icon_button(tu, glyph, if self.table_open { "Hide the folder list" } else { "Show the folder list" }, th().muted).clicked() {
+                self.table_open = !self.table_open;
+                let _ = self.save_settings();
+            }
             if pills(tu, &[("Share of total", self.relative)]).is_some() {
                 self.relative = !self.relative;
+                let _ = self.save_settings();
                 self.relayout(now);
             }
+            // the drive is read from the cache; walking it again happens only when asked
+            if !running && pills(tu, &[("\u{21BB}  Refresh", false)]).is_some() {
+                refresh = true;
+            }
         });
+        if refresh && let Some(s) = &self.space {
+            let c = tu.ctx().clone();
+            s.scan.refresh(move || c.request_repaint());
+        }
         if let Some(id) = go {
             if let Some(s) = &mut self.space {
                 s.at = id;
@@ -1644,7 +1747,7 @@ impl App {
     /// side, filled by load. On a hybrid CPU each core says whether it is a performance or efficiency core.
     fn draw_cores(&mut self, ui: &Ui, r: Rect) {
         let p = ui.painter().with_clip_rect(r);
-        p.rect_filled(r, 10.0, rgb(0x12151B));
+        p.rect_filled(r, 10.0, th().tm_bg);
         let Some(t) = self.tot.clone() else { return };
         let on_cpu = split_by_cpu(&self.procs, &t.per_core);
         let mut segs: Vec<(Rect, usize)> = Vec::new(); // for hover and click
@@ -1661,19 +1764,19 @@ impl App {
             let cell = Rect::from_min_size(r.min + vec2(4.0 + (i % cols) as f32 * cw, 4.0 + (i / cols) as f32 * ch), vec2(cw, ch)).shrink(3.0);
             let loads: Vec<f32> = threads.iter().map(|&k| t.per_core.get(k).copied().unwrap_or(0.0)).collect();
             let avg = loads.iter().sum::<f32>() / loads.len().max(1) as f32;
-            p.rect_filled(cell, 6.0, mix(C_CPU, BG, 0.86));
+            p.rect_filled(cell, 6.0, mix(ac().cpu, th().bg, 0.86));
             let kind = if hybrid { if *class == top_class { " · P-core" } else { " · E-core" } } else { "" };
-            text(&p, cell.min + vec2(8.0, 6.0), Align2::LEFT_TOP, &format!("Core {i}{kind}"), bold(12.0), TEXT, cell.width() - 70.0);
-            text(&p, pos2(cell.right() - 8.0, cell.top() + 6.0), Align2::RIGHT_TOP, &format!("{avg:.0}%"), bold(12.0), TEXT, 60.0);
+            text(&p, cell.min + vec2(8.0, 6.0), Align2::LEFT_TOP, &format!("Core {i}{kind}"), bold(12.0), th().text, cell.width() - 70.0);
+            text(&p, pos2(cell.right() - 8.0, cell.top() + 6.0), Align2::RIGHT_TOP, &format!("{avg:.0}%"), bold(12.0), th().text, 60.0);
             let inner = Rect::from_min_max(cell.min + vec2(8.0, 28.0), cell.max - vec2(8.0, 8.0));
             let tn = loads.len().max(1) as f32;
             let tw = (inner.width() - 6.0 * (tn - 1.0)) / tn;
             for (j, (&v, &k)) in loads.iter().zip(threads).enumerate() {
                 let tr = Rect::from_min_size(pos2(inner.left() + j as f32 * (tw + 6.0), inner.top()), vec2(tw, inner.height()));
-                p.rect_filled(tr, 4.0, LINE);
+                p.rect_filled(tr, 4.0, th().line);
                 let fh = (v / 100.0).clamp(0.0, 1.0) * tr.height();
                 if fh > 0.5 {
-                    p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 4.0, mix(rgb(0x2B4F7A), C_CPU, v / 100.0));
+                    p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 4.0, mix(rgb(0x2B4F7A), ac().cpu, v / 100.0));
                 }
                 // the fill split into the processes that ran here, biggest at the bottom, scaled to the
                 // measured load (the attribution is an estimate, the load is not)
@@ -1689,15 +1792,15 @@ impl App {
                     }
                     let sr = Rect::from_min_max(pos2(tr.left(), y - sh), pos2(tr.right(), y));
                     let name = &self.procs[pi].name;
-                    p.rect_filled(sr.shrink2(vec2(0.0, 0.5)), 3.0, mix(app_color(name), BG, 0.15));
+                    p.rect_filled(sr.shrink2(vec2(0.0, 0.5)), 3.0, mix(app_color(name), th().bg, 0.15));
                     if sh >= 15.0 {
                         text(&p, pos2(sr.left() + 5.0, sr.center().y), Align2::LEFT_CENTER, name, font(10.0), alpha(Color32::WHITE, 0xE0), tw - 10.0);
                     }
                     segs.push((sr, pi));
                     y -= sh;
                 }
-                text(&p, tr.min + vec2(6.0, 4.0), Align2::LEFT_TOP, &format!("Thread {}", j + 1), font(10.0), MUTED, tw - 10.0);
-                text(&p, tr.min + vec2(6.0, 17.0), Align2::LEFT_TOP, &format!("CPU {k}  ·  {v:.0}%"), font(10.0), TEXT, tw - 10.0);
+                text(&p, tr.min + vec2(6.0, 4.0), Align2::LEFT_TOP, &format!("Thread {}", j + 1), font(10.0), th().muted, tw - 10.0);
+                text(&p, tr.min + vec2(6.0, 17.0), Align2::LEFT_TOP, &format!("CPU {k}  ·  {v:.0}%"), font(10.0), th().text, tw - 10.0);
             }
         }
         // hover: which process, how much of this CPU; click selects it
@@ -1717,14 +1820,14 @@ impl App {
             q.cpu,
             lines.join("  ·  ")
         );
-        let g = p.layout(body, font(11.0), MUTED, 296.0);
+        let g = p.layout(body, font(11.0), th().muted, 296.0);
         let sz = vec2(320.0, g.size().y + 44.0);
         let x = if pos.x + 16.0 + sz.x < r.right() { pos.x + 16.0 } else { pos.x - sz.x - 16.0 };
         let y = if pos.y + 16.0 + sz.y < r.bottom() { pos.y + 16.0 } else { pos.y - sz.y - 8.0 };
         let tr = Rect::from_min_size(pos2(x, y), sz);
-        p.rect(tr, 10.0, alpha(rgb(0x1C2029), 0xF5), Stroke::new(1.0, LINE), StrokeKind::Inside);
-        text(&p, tr.min + vec2(12.0, 12.0), Align2::LEFT_TOP, &q.name, bold(13.0), TEXT, 296.0);
-        p.galley(tr.min + vec2(12.0, 34.0), g, MUTED);
+        p.rect(tr, 10.0, alpha(th().raised, 0xF5), Stroke::new(1.0, th().line), StrokeKind::Inside);
+        text(&p, tr.min + vec2(12.0, 12.0), Align2::LEFT_TOP, &q.name, bold(13.0), th().text, 296.0);
+        p.galley(tr.min + vec2(12.0, 34.0), g, th().muted);
     }
 
     fn treemap(&mut self, ui: &mut Ui, r: Rect, now: f64) {
@@ -1733,7 +1836,7 @@ impl App {
             return;
         }
         let p = ui.painter().with_clip_rect(r);
-        p.rect_filled(r, 10.0, rgb(0x12151B));
+        p.rect_filled(r, 10.0, th().tm_bg);
         if (r.size() - self.tm_size).length() > 0.5 {
             self.tm_size = r.size();
             if !self.procs.is_empty() {
@@ -1753,9 +1856,9 @@ impl App {
             let value = self.fmt_metric(t.value);
             if t.header {
                 // a group frame: dark, its processes sit on top
-                p.rect_filled(tr, 3.0, mix(c, BG, 0.55));
+                p.rect_filled(tr, 3.0, mix(c, th().bg, 0.55));
                 if tr.width() >= 46.0 {
-                    text(&p, tr.min + vec2(6.0, 3.0), Align2::LEFT_TOP, &format!("{}   {value}", t.title), bold(11.0), alpha(Color32::WHITE, 0xEE), tr.width() - 10.0);
+                    text(&p, tr.min + vec2(6.0, 3.0), Align2::LEFT_TOP, &format!("{}   {value}", t.title), bold(11.0), if th().light { th().text } else { alpha(Color32::WHITE, 0xEE) }, tr.width() - 10.0);
                 }
             } else {
                 p.rect_filled(tr, 3.0, mix(c, Color32::WHITE, 0.05));
@@ -1763,10 +1866,10 @@ impl App {
                     p.line_segment([tr.left_top() + vec2(2.0, 0.5), tr.right_top() + vec2(-2.0, 0.5)], Stroke::new(1.0, mix(c, Color32::WHITE, 0.3)));
                 }
                 if tr.width() >= 46.0 && tr.height() >= 18.0 {
-                    text(&p, tr.min + vec2(6.0, 3.0), Align2::LEFT_TOP, &t.title, bold(11.0), alpha(Color32::WHITE, 0xEE), tr.width() - 10.0);
+                    text(&p, tr.min + vec2(6.0, 3.0), Align2::LEFT_TOP, &t.title, bold(11.0), if t.free && th().light { th().muted } else { alpha(Color32::WHITE, 0xEE) }, tr.width() - 10.0);
                 }
                 if tr.width() >= 46.0 && tr.height() >= 34.0 {
-                    text(&p, tr.min + vec2(6.0, 18.0), Align2::LEFT_TOP, &value, font(10.0), alpha(Color32::WHITE, 0xB0), tr.width() - 10.0);
+                    text(&p, tr.min + vec2(6.0, 18.0), Align2::LEFT_TOP, &value, font(10.0), if t.free && th().light { th().faint } else { alpha(Color32::WHITE, 0xB0) }, tr.width() - 10.0);
                 }
             }
         }
@@ -1782,7 +1885,7 @@ impl App {
                 (!self.procs.is_empty()).then(|| "Nothing uses this resource right now".to_string())
             };
             if let Some(m) = msg {
-                p.text(r.center(), Align2::CENTER_CENTER, m, font(13.0), FAINT);
+                p.text(r.center(), Align2::CENTER_CENTER, m, font(13.0), th().faint);
             }
         }
         let resp = ui.interact(r, Id::unique("treemap"), Sense::click());
@@ -1812,19 +1915,19 @@ impl App {
         }
         if let Some((a, b)) = self.split_fields() {
             let hw = (r.width() - SPLIT_GAP) / 2.0;
-            let labels = if a == Field::IoRead { [(I_READ, "Read", C_DISK), (I_WRITE, "Write", C_DISK2)] } else { [(I_DOWN, "Download", C_NET), (I_UP, "Upload", C_NET2)] };
+            let labels = if a == Field::IoRead { [(I_READ, "Read", ac().disk), (I_WRITE, "Write", ac().disk2)] } else { [(I_DOWN, "Download", ac().net), (I_UP, "Upload", ac().net2)] };
             for (side, (f, (ic, label, c))) in [a, b].into_iter().zip(labels).enumerate() {
                 let x = r.left() + side as f32 * (hw + SPLIT_GAP);
                 let cap = Rect::from_min_size(pos2(x, r.top()), vec2(hw, SPLIT_CAPTION));
                 let total: f64 = self.procs.iter().map(|q| q.get(f)).sum();
                 p.text(pos2(cap.left() + 10.0, cap.center().y), Align2::LEFT_CENTER, ic, icons(14.0), c);
-                let tr = text(&p, pos2(cap.left() + 32.0, cap.center().y), Align2::LEFT_CENTER, label, bold(13.0), TEXT, 120.0);
-                text(&p, pos2(tr.right() + 10.0, cap.center().y), Align2::LEFT_CENTER, &fmt_rate(total), font(12.0), MUTED, 140.0);
+                let tr = text(&p, pos2(cap.left() + 32.0, cap.center().y), Align2::LEFT_CENTER, label, bold(13.0), th().text, 120.0);
+                text(&p, pos2(tr.right() + 10.0, cap.center().y), Align2::LEFT_CENTER, &fmt_rate(total), font(12.0), th().muted, 140.0);
                 let empty = !self.tiles.iter().any(|t| matches!(&t.key, Key::Side(s, _) if *s as usize == side));
                 if empty && !self.procs.is_empty() {
                     let body = Rect::from_min_max(pos2(x, cap.bottom()), pos2(x + hw, r.bottom()));
                     let net_err = self.tot.as_ref().and_then(|t| t.net_err.clone()).filter(|_| a == Field::NetDown);
-                    p.text(body.center(), Align2::CENTER_CENTER, net_err.unwrap_or_else(|| "Nothing right now".into()), font(12.0), FAINT);
+                    p.text(body.center(), Align2::CENTER_CENTER, net_err.unwrap_or_else(|| "Nothing right now".into()), font(12.0), th().faint);
                 }
             }
         }
@@ -1859,15 +1962,15 @@ impl App {
         if let (Some(h), Some(pos)) = (target, pos) {
             let (title, body) = self.describe(&h);
             let p = ui.painter().with_clip_rect(r);
-            let bg = p.layout(body, font(11.0), MUTED, 296.0);
+            let bg = p.layout(body, font(11.0), th().muted, 296.0);
             let sz = vec2(320.0, bg.size().y + 44.0);
             let x = if pos.x + 16.0 + sz.x < r.right() { pos.x + 16.0 } else { (pos.x - sz.x - 16.0).max(r.left()) };
             let y = if pos.y + 16.0 + sz.y < r.bottom() { pos.y + 16.0 } else { (pos.y - sz.y - 8.0).max(r.top()) };
             let tr = Rect::from_min_size(pos2(x, y), sz);
             p.add(egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: alpha(Color32::BLACK, 0x90) }.as_shape(tr, 10.0));
-            p.rect(tr, 10.0, alpha(rgb(0x1C2029), 0xF5), Stroke::new(1.0, LINE), StrokeKind::Inside);
-            text(&p, tr.min + vec2(12.0, 12.0), Align2::LEFT_TOP, &title, bold(13.0), TEXT, 296.0);
-            p.galley(tr.min + vec2(12.0, 34.0), bg, MUTED);
+            p.rect(tr, 10.0, alpha(th().raised, 0xF5), Stroke::new(1.0, th().line), StrokeKind::Inside);
+            text(&p, tr.min + vec2(12.0, 12.0), Align2::LEFT_TOP, &title, bold(13.0), th().text, 296.0);
+            p.galley(tr.min + vec2(12.0, 34.0), bg, th().muted);
         }
     }
 
@@ -1887,19 +1990,19 @@ impl App {
                 None => ("Click a folder to select it, double-click to open it. Click a card above to go back to processes.".to_string(), None, false),
             }
         };
-        let c = if path.is_some() { TEXT } else { MUTED };
+        let c = if path.is_some() { th().text } else { th().muted };
         text(ui.painter(), pos2(r.left() + 12.0, r.center().y), Align2::LEFT_CENTER, &msg, font(12.0), c, r.width() - 24.0 - if path.is_some() { 330.0 } else { 0.0 });
         let (Some(path), Some(d)) = (path, sel) else { return };
         let mut au = ui.new_child(UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
-        if link(&mut au, "Show in Explorer", MUTED, 12.0).clicked() {
+        if link(&mut au, "Show in Explorer", th().muted, 12.0).clicked() {
             use std::os::windows::process::CommandExt;
             let _ = std::process::Command::new("explorer").raw_arg(format!("\"{path}\"")).spawn();
         }
-        if link(&mut au, "Copy path", MUTED, 12.0).clicked() {
+        if link(&mut au, "Copy path", th().muted, 12.0).clicked() {
             ui.ctx().copy_text(path);
             self.toast("Copied path", false, now);
         }
-        if kids && link(&mut au, "Open", MUTED, 12.0).clicked() {
+        if kids && link(&mut au, "Open", th().muted, 12.0).clicked() {
             self.space_enter(d, now);
         }
     }
@@ -1928,10 +2031,10 @@ impl App {
         for (label, w, num) in cols {
             let cr = Rect::from_min_size(pos2(x, hr.top()), vec2(w, 22.0));
             let (pos, al) = if num { (pos2(cr.right() - 6.0, cr.center().y), Align2::RIGHT_CENTER) } else { (pos2(cr.left() + 6.0, cr.center().y), Align2::LEFT_CENTER) };
-            text(tu.painter(), pos, al, label, bold(11.0), MUTED, w - 12.0);
+            text(tu.painter(), pos, al, label, bold(11.0), th().muted, w - 12.0);
             x += w;
         }
-        tu.painter().line_segment([pos2(r.left(), hr.bottom()), pos2(r.right(), hr.bottom())], Stroke::new(1.0, LINE));
+        tu.painter().line_segment([pos2(r.left(), hr.bottom()), pos2(r.right(), hr.bottom())], Stroke::new(1.0, th().line));
         let sel = match self.sel {
             Some(Hit::Dir(d)) => Some(d),
             _ => None,
@@ -1941,9 +2044,9 @@ impl App {
             for (id, name, total, files, kids) in &rows[range] {
                 let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
                 if sel == Some(*id) {
-                    ui.painter().rect_filled(rr, 6.0, rgb(0x243049));
+                    ui.painter().rect_filled(rr, 6.0, th().row_sel);
                 } else if resp.hovered() {
-                    ui.painter().rect_filled(rr, 6.0, alpha(TEXT, 10));
+                    ui.painter().rect_filled(rr, 6.0, alpha(th().text, 10));
                 }
                 if resp.clicked() {
                     clicked = Some(*id);
@@ -1955,7 +2058,7 @@ impl App {
                 let mut x = rr.left();
                 for (c, ((_, w, num), v)) in cols.iter().zip(vals).enumerate() {
                     let (pos, al) = if *num { (pos2(x + w - 6.0, rr.center().y), Align2::RIGHT_CENTER) } else { (pos2(x + 6.0, rr.center().y), Align2::LEFT_CENTER) };
-                    text(ui.painter(), pos, al, &v, font(12.0), if c == 0 { TEXT } else { MUTED }, w - 12.0);
+                    text(ui.painter(), pos, al, &v, font(12.0), if c == 0 { th().text } else { th().muted }, w - 12.0);
                     x += w;
                 }
             }
@@ -1969,7 +2072,7 @@ impl App {
     }
 
     fn selbar(&mut self, ui: &mut Ui, r: Rect, now: f64) {
-        ui.painter().rect_filled(r, 10.0, CARD);
+        ui.painter().rect_filled(r, 10.0, th().card);
         if self.space.is_some() {
             self.space_selbar(ui, r, now);
             return;
@@ -1977,11 +2080,11 @@ impl App {
         let qs = self.selected();
         let k = self.cpu_scale();
         let (msg, c) = match (qs.first(), &self.sel) {
-            (None, _) => ("Click a tile or a row to select it. Double-click an app to see its processes. Click a card above to size the treemap by it.".to_string(), MUTED),
-            (Some(q), Some(Hit::Pid(_))) => (format!("{}   PID {}   ·   {}   ·   CPU {:.1}%", q.name, q.pid, fmt_bytes(q.ws), q.cpu * k), TEXT),
+            (None, _) => ("Click a tile or a row to select it. Double-click an app to see its processes. Click a card above to size the treemap by it.".to_string(), th().muted),
+            (Some(q), Some(Hit::Pid(_))) => (format!("{}   PID {}   ·   {}   ·   CPU {:.1}%", q.name, q.pid, fmt_bytes(q.ws), q.cpu * k), th().text),
             (Some(q), _) => (
                 format!("{}   {} processes   ·   {}   ·   CPU {:.1}%", q.name, qs.len(), fmt_bytes(qs.iter().map(|q| q.ws).sum()), qs.iter().map(|q| q.cpu).sum::<f64>() * k),
-                TEXT,
+                th().text,
             ),
         };
         let pids: Vec<u32> = qs.iter().map(|q| q.pid).collect();
@@ -1996,7 +2099,7 @@ impl App {
             let me = pids.contains(&std::process::id());
             self.kill_ask = Some(KillAsk { pids: pids.clone(), what, me, tree: false });
         }
-        au.menu_button(egui::RichText::new("Priority").font(font(12.0)).color(MUTED), |ui| {
+        au.menu_button(egui::RichText::new("Priority").font(font(12.0)).color(th().muted), |ui| {
             for (label, class) in sys::PRIORITIES {
                 if ui.button(label).clicked() {
                     let ok = pids.iter().filter(|&&p| sys::set_priority(p, class)).count();
@@ -2010,10 +2113,10 @@ impl App {
                 }
             }
         });
-        if link(&mut au, "Open location", MUTED, 12.0).clicked() {
+        if link(&mut au, "Open location", th().muted, 12.0).clicked() {
             self.open_location(pid, now);
         }
-        if link(&mut au, "Copy command line", MUTED, 12.0).clicked() {
+        if link(&mut au, "Copy command line", th().muted, 12.0).clicked() {
             if cmd.is_empty() {
                 self.toast("Command line not accessible (needs administrator)", true, now);
             } else {
@@ -2021,7 +2124,7 @@ impl App {
                 self.toast("Copied command line", false, now);
             }
         }
-        if link(&mut au, "Copy PID", MUTED, 12.0).clicked() {
+        if link(&mut au, "Copy PID", th().muted, 12.0).clicked() {
             ui.ctx().copy_text(pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "));
             self.toast(if pids.len() == 1 { "Copied PID".into() } else { format!("Copied {} PIDs", pids.len()) }, false, now);
         }
@@ -2034,7 +2137,7 @@ impl App {
         }
         let mut tu = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Min)));
         tu.horizontal(|ui| {
-            let fr = egui::Frame::new().fill(CARD).corner_radius(10.0).inner_margin(egui::Margin::symmetric(10, 8));
+            let fr = egui::Frame::new().fill(th().card).corner_radius(10.0).inner_margin(egui::Margin::symmetric(10, 8));
             fr.show(ui, |ui| {
                 let te = egui::TextEdit::singleline(&mut self.query).hint_text("Filter by name, PID or command line").desired_width(340.0).frame(egui::Frame::NONE).font(font(13.0));
                 if ui.add(te).changed() {
@@ -2042,7 +2145,7 @@ impl App {
                 }
             });
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(format!("{} shown", self.rows.len())).font(font(12.0)).color(FAINT));
+            ui.label(egui::RichText::new(format!("{} shown", self.rows.len())).font(font(12.0)).color(th().faint));
         });
         tu.add_space(6.0);
         let fixed: f32 = COLS.iter().map(|c| c.2).sum();
@@ -2061,7 +2164,7 @@ impl App {
                 l += if self.sort.1 { " ↓" } else { " ↑" };
             }
             let (pos, al) = if *num { (pos2(cr.right() - 6.0, cr.center().y), Align2::RIGHT_CENTER) } else { (pos2(cr.left() + 6.0, cr.center().y), Align2::LEFT_CENTER) };
-            text(tu.painter(), pos, al, &l, bold(11.0), if on || resp.hovered() { TEXT } else { MUTED }, w - 12.0);
+            text(tu.painter(), pos, al, &l, bold(11.0), if on || resp.hovered() { th().text } else { th().muted }, w - 12.0);
             if resp.hovered() {
                 tu.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
@@ -2070,7 +2173,7 @@ impl App {
                 self.refresh_rows();
             }
         }
-        tu.painter().line_segment([pos2(r.left(), hr.bottom()), pos2(r.right(), hr.bottom())], Stroke::new(1.0, LINE));
+        tu.painter().line_segment([pos2(r.left(), hr.bottom()), pos2(r.right(), hr.bottom())], Stroke::new(1.0, th().line));
         let sel: HashSet<u32> = self.selected().iter().map(|q| q.pid).collect();
         let pdh = self.tot.as_ref().is_some_and(|t| t.pdh_ok);
         let k = self.cpu_scale();
@@ -2080,9 +2183,9 @@ impl App {
                 let q = &self.procs[i];
                 let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
                 if sel.contains(&q.pid) {
-                    ui.painter().rect_filled(rr, 6.0, rgb(0x243049));
+                    ui.painter().rect_filled(rr, 6.0, th().row_sel);
                 } else if resp.hovered() {
-                    ui.painter().rect_filled(rr, 6.0, alpha(TEXT, 10));
+                    ui.painter().rect_filled(rr, 6.0, alpha(th().text, 10));
                 }
                 if resp.clicked() {
                     clicked = Some(q.pid);
@@ -2107,7 +2210,7 @@ impl App {
                     let w = if *w == 0.0 { cmd_w } else { *w };
                     let x = rr.left() + COLS[..c].iter().map(|c| c.2).sum::<f32>();
                     let (pos, al) = if *num { (pos2(x + w - 6.0, rr.center().y), Align2::RIGHT_CENTER) } else { (pos2(x + 6.0, rr.center().y), Align2::LEFT_CENTER) };
-                    text(ui.painter(), pos, al, &v, font(12.0), if c == 0 { TEXT } else { MUTED }, w - 12.0);
+                    text(ui.painter(), pos, al, &v, font(12.0), if c == 0 { th().text } else { th().muted }, w - 12.0);
                 }
             }
         });
@@ -2116,15 +2219,111 @@ impl App {
         }
     }
 
+    /// Settings: which cards, what the docked tab shows, theme and colours, timing, start-up.
+    fn settings_sheet(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        ui.interact(r, Id::unique("sheet-bg"), Sense::click()); // the map underneath gets no clicks
+        let p = ui.painter().clone();
+        p.add(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: alpha(Color32::BLACK, if th().light { 0x40 } else { 0xA0 }) }.as_shape(r, 14.0));
+        p.rect(r, 14.0, th().card, Stroke::new(1.0, th().sel_line), StrokeKind::Inside);
+        let mut su = ui.new_child(UiBuilder::new().max_rect(r.shrink(18.0)).layout(Layout::top_down(Align::Min)));
+        let mut changed = false;
+        let mut retheme = false;
+        su.horizontal(|ui| {
+            ui.label(egui::RichText::new("Settings").font(bold(16.0)).color(th().text));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, "\u{E8BB}", "Close settings", th().muted).clicked() {
+                    self.settings_open = false;
+                }
+            });
+        });
+        let section = |ui: &mut Ui, t: &str| {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(t).font(bold(10.0)).color(th().muted));
+            ui.add_space(4.0);
+        };
+        egui::ScrollArea::vertical().auto_shrink(false).show(&mut su, |ui| {
+            section(ui, "CARDS");
+            ui.horizontal_wrapped(|ui| {
+                for (key, label) in settings::CARDS {
+                    let mut on = self.cfg.shows(key);
+                    if ui.checkbox(&mut on, label).changed() {
+                        self.cfg.hidden.retain(|h| h != key);
+                        if !on {
+                            self.cfg.hidden.push(key.into());
+                        }
+                        changed = true;
+                    }
+                }
+            });
+            section(ui, "DOCKED TAB  ·  bars, up to four");
+            ui.horizontal_wrapped(|ui| {
+                for (key, label) in settings::TAB_BARS {
+                    let mut on = self.cfg.tab.iter().any(|t| t == key);
+                    let can = on || self.cfg.tab.len() < 4;
+                    if ui.add_enabled(can, egui::Checkbox::new(&mut on, label)).changed() {
+                        if on {
+                            self.cfg.tab.push(key.into());
+                        } else if self.cfg.tab.len() > 1 {
+                            self.cfg.tab.retain(|t| t != key);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+            section(ui, "THEME");
+            let names: Vec<&str> = theme::THEMES.iter().map(|t| t.name).collect();
+            let items: Vec<(&str, bool)> = names.iter().map(|n| (*n, *n == self.cfg.theme)).collect();
+            if let Some(i) = pills(ui, &items) {
+                self.cfg.theme = names[i].into();
+                (changed, retheme) = (true, true);
+            }
+            section(ui, "COLOURS");
+            let names: Vec<&str> = theme::ACCENTS.iter().map(|a| a.name).collect();
+            let items: Vec<(&str, bool)> = names.iter().map(|n| (*n, *n == self.cfg.accents)).collect();
+            if let Some(i) = pills(ui, &items) {
+                self.cfg.accents = names[i].into();
+                (changed, retheme) = (true, true);
+            }
+            section(ui, "BEHAVIOUR");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Panel opens after").color(th().text));
+                if ui.add(egui::Slider::new(&mut self.cfg.hover, 0.2..=2.0).suffix(" s").step_by(0.1)).changed() {
+                    changed = true;
+                }
+            });
+            if ui.checkbox(&mut self.table_open, "Show the process list under the map").changed() {
+                changed = true;
+            }
+            let mut st = self.startup;
+            if ui.checkbox(&mut st, "Start with Windows").changed() {
+                self.toggle_startup(now);
+            }
+            ui.add_space(16.0);
+            if ui.button("Quit ResMon").clicked() {
+                self.quit = true;
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Saved as you change them, in %APPDATA%\\ResMon\\settings.txt").font(font(11.0)).color(th().faint));
+        });
+        if retheme {
+            theme::set(&self.cfg.theme, &self.cfg.accents);
+            apply_visuals(ui.ctx());
+        }
+        if changed {
+            let _ = self.save_settings();
+            self.relayout(now);
+        }
+    }
+
     fn kill_dialog(&mut self, ctx: &egui::Context, now: f64) {
         let Some(ask) = &mut self.kill_ask else { return };
         let mut done: Option<bool> = None;
-        egui::Modal::new(Id::unique("kill")).frame(egui::Frame::new().fill(CARD).corner_radius(14.0).inner_margin(22.0).stroke(Stroke::new(1.0, LINE))).show(ctx, |ui| {
+        egui::Modal::new(Id::unique("kill")).frame(egui::Frame::new().fill(th().card).corner_radius(14.0).inner_margin(22.0).stroke(Stroke::new(1.0, th().line))).show(ctx, |ui| {
             ui.set_width(420.0);
-            ui.label(egui::RichText::new("End task?").font(bold(18.0)).color(TEXT));
+            ui.label(egui::RichText::new("End task?").font(bold(18.0)).color(th().text));
             ui.add_space(10.0);
             let warn = if ask.me { "  This is ResMon itself." } else { "" };
-            ui.label(egui::RichText::new(format!("End {}? Unsaved data in it will be lost.{warn}", ask.what)).font(font(13.0)).color(MUTED));
+            ui.label(egui::RichText::new(format!("End {}? Unsaved data in it will be lost.{warn}", ask.what)).font(font(13.0)).color(th().muted));
             ui.add_space(10.0);
             ui.checkbox(&mut ask.tree, "Also end all child processes (process tree)");
             ui.add_space(14.0);
@@ -2231,19 +2430,24 @@ fn setup_style(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name("semi".into()), semi);
     fonts.families.insert(FontFamily::Name("icons".into()), ic);
     ctx.set_fonts(fonts);
+    apply_visuals(ctx);
+}
+
+/// egui's own widgets (menus, checkboxes, text fields) in the current theme.
+fn apply_visuals(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         let v = &mut s.visuals;
-        *v = egui::Visuals::dark();
+        *v = if th().light { egui::Visuals::light() } else { egui::Visuals::dark() };
         v.panel_fill = Color32::TRANSPARENT;
-        v.window_fill = CARD;
-        v.window_stroke = Stroke::new(1.0, LINE);
-        v.extreme_bg_color = CARD;
-        v.selection.bg_fill = rgb(0x2E4A7A);
+        v.window_fill = th().card;
+        v.window_stroke = Stroke::new(1.0, th().line);
+        v.extreme_bg_color = th().card;
+        v.selection.bg_fill = if th().light { rgb(0xB9CCEA) } else { rgb(0x2E4A7A) };
         v.override_text_color = None;
-        v.widgets.noninteractive.fg_stroke.color = MUTED;
-        v.widgets.inactive.fg_stroke.color = TEXT;
-        v.widgets.inactive.weak_bg_fill = PILL_ON;
-        v.widgets.hovered.weak_bg_fill = rgb(0x323A4D);
+        v.widgets.noninteractive.fg_stroke.color = th().muted;
+        v.widgets.inactive.fg_stroke.color = th().text;
+        v.widgets.inactive.weak_bg_fill = th().pill_on;
+        v.widgets.hovered.weak_bg_fill = mix(th().pill_on, th().text, 0.12);
         v.menu_corner_radius = 10.into();
         s.text_styles.insert(egui::TextStyle::Body, font(13.0));
         s.text_styles.insert(egui::TextStyle::Button, font(13.0));

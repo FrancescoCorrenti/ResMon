@@ -449,6 +449,7 @@ pub struct Totals {
     pub net_d: f64,
     pub net_u: f64,
     pub drives: Vec<(String, u64, u64)>,
+    pub drive_io: Vec<(String, f64, f64)>, // per volume ("C:"): read, write bytes/s
     pub pdh_ok: bool,
     pub gpu_err: Option<String>,
     pub net_err: Option<String>, // why per-process network is missing
@@ -567,6 +568,8 @@ impl Sampler {
                 r"\PhysicalDisk(_Total)\Disk Write Bytes/sec",
                 r"\Network Interface(*)\Bytes Received/sec",
                 r"\Network Interface(*)\Bytes Sent/sec",
+                r"\LogicalDisk(*)\Disk Read Bytes/sec",
+                r"\LogicalDisk(*)\Disk Write Bytes/sec",
             ]),
             gpu: Pdh::new(&[r"\GPU Engine(*)\Utilization Percentage", r"\GPU Process Memory(*)\Dedicated Usage"]),
             cores,
@@ -592,9 +595,12 @@ impl Sampler {
         let (commit, commit_limit) = commit_bytes();
         let gpu = self.nvml.as_ref().map(|n| n.sample()).unwrap_or_default();
         let (mut disk_r, mut disk_w, mut net_d, mut net_u) = (0.0, 0.0, 0.0, 0.0);
+        let mut drive_io = Vec::new();
         if let Some(p) = &self.io {
             p.collect();
             (disk_r, disk_w, net_d, net_u) = (p.sum(0), p.sum(1), p.sum(2), p.sum(3));
+            let w: HashMap<String, f64> = p.array(5, false).into_iter().collect();
+            drive_io = p.array(4, false).into_iter().filter(|(n, _)| n.ends_with(':')).map(|(n, r)| { let wv = w.get(&n).copied().unwrap_or(0.0); (n, r, wv) }).collect();
         }
         push(&mut h.cpu, cpu);
         push(&mut h.ram, ram_used as f32 / ram_total.max(1) as f32 * 100.0);
@@ -624,6 +630,7 @@ impl Sampler {
             net_d,
             net_u,
             drives: self.drives.clone(),
+            drive_io,
             pdh_ok: self.gpu.is_some(),
             gpu_err: self.gpu_err.clone(),
             net_err: self.net_err.clone(),
@@ -809,11 +816,6 @@ pub fn load_anchor() -> Option<(i32, i32)> {
     monitor_exists(x, y).then_some((x, y))
 }
 
-pub fn save_anchor((x, y): (i32, i32)) -> std::io::Result<()> {
-    let p = settings_path();
-    std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(p, format!("{{\"anchor\": [{x}, {y}]}}"))
-}
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
