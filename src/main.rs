@@ -13,6 +13,7 @@ mod settings;
 mod space;
 mod sys;
 mod theme;
+mod timeline;
 mod treemap;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -39,6 +40,7 @@ const SPLIT_GAP: f32 = 10.0; // split view (disk read | write, network down | up
 const SPLIT_CAPTION: f32 = 28.0; // and the caption band over each half
 
 const DANGER: Color32 = Color32::from_rgb(0xF0, 0x62, 0x72);
+const WARN: Color32 = Color32::from_rgb(0xF2, 0xB3, 0x3D);
 // Segoe Fluent Icons glyphs
 const I_CPU: &str = "\u{EEA1}";
 const I_RAM: &str = "\u{EEA0}";
@@ -223,24 +225,47 @@ struct Shared {
     busy: bool,
     hover_fire: bool,
     hover: f32, // seconds resting on the tab before the panel opens (a setting)
+    alerts: Vec<timeline::Alert>,
+    alerts_on: bool,
+    mute: Vec<String>, // alert kinds the user muted for 30 min
 }
 
-fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
+fn spawn_threads(sh: Arc<Mutex<Shared>>, tl: Arc<Mutex<timeline::Timeline>>, ctx: egui::Context) {
     let (s1, c1) = (sh.clone(), ctx.clone());
     std::thread::spawn(move || {
         let mut s = sys::Sampler::new();
         let mut hist = History::default();
         let mut next_tot = Instant::now();
         let mut last_procs: Option<Instant> = None;
+        let mut last_bg: Option<Instant> = None; // the 24 h history and the alerts sample processes even docked
+        let mut last_tot = Totals::default();
+        let mut latest: Arc<Vec<Proc>> = Arc::new(Vec::new());
+        let mut alerts = timeline::Alerts::default();
         loop {
             let now = Instant::now();
             if now >= next_tot {
-                let t = s.sample_totals(&mut hist);
+                last_tot = s.sample_totals(&mut hist);
                 let mut g = s1.lock().unwrap();
-                (g.tot, g.hist, g.tot_seq) = (Some(t), hist.clone(), g.tot_seq + 1);
+                for kind in std::mem::take(&mut g.mute) {
+                    alerts.mute(&kind);
+                }
+                if g.alerts_on {
+                    alerts.update(&last_tot, &latest);
+                } else {
+                    alerts.list.clear();
+                }
+                let changed = g.alerts.len() != alerts.list.len() || g.alerts.iter().zip(&alerts.list).any(|(a, b)| a.text != b.text);
+                g.alerts = alerts.list.clone();
+                if std::env::var_os("RESMON_FAKE_ALERT").is_some() {
+                    // for screenshots and checks of the alert strip
+                    let top = latest.iter().max_by(|a, b| a.ws.total_cmp(&b.ws));
+                    g.alerts.push(timeline::Alert { kind: "ram", critical: false, text: format!("Memory at 93%: {} uses 6.1 GB", top.map_or("?", |q| q.name.as_str())), pid: top.map(|q| q.pid) });
+                }
+                (g.tot, g.hist, g.tot_seq) = (Some(last_tot.clone()), hist.clone(), g.tot_seq + 1);
                 drop(g);
                 next_tot = now + Duration::from_millis(500);
                 c1.request_repaint();
+                let _ = changed;
             }
             let (want, asap) = {
                 let mut g = s1.lock().unwrap();
@@ -248,13 +273,21 @@ fn spawn_threads(sh: Arc<Mutex<Shared>>, ctx: egui::Context) {
                 (g.want_procs, std::mem::take(&mut g.procs_now))
             };
             s.set_net(want);
-            if want && (asap || last_procs.is_none_or(|t| now - t >= Duration::from_millis(1500))) {
-                let p = Arc::new(s.sample_procs());
+            let bg_due = last_bg.is_none_or(|t| now - t >= Duration::from_secs(timeline::EVERY));
+            let fg_due = want && (asap || last_procs.is_none_or(|t| now - t >= Duration::from_millis(1500)));
+            if fg_due || (bg_due && !want) {
+                latest = Arc::new(s.sample_procs());
                 last_procs = Some(now);
-                let mut g = s1.lock().unwrap();
-                (g.procs, g.procs_seq) = (Some(p), g.procs_seq + 1);
-                drop(g);
-                c1.request_repaint();
+                if want {
+                    let mut g = s1.lock().unwrap();
+                    (g.procs, g.procs_seq) = (Some(latest.clone()), g.procs_seq + 1);
+                    drop(g);
+                    c1.request_repaint();
+                }
+            }
+            if bg_due && last_procs.is_some() {
+                tl.lock().unwrap().push(&last_tot, &latest);
+                last_bg = Some(now);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -392,7 +425,8 @@ struct App {
     space: Option<SpaceView>, // Some: the treemap and table show disk space instead of processes
     scans: HashMap<String, space::Scan>, // drives walked or walking, kept while another view is shown
     cores: Vec<(Vec<usize>, u8)>, // physical cores: their threads (logical processors) and efficiency class
-    space_seen: u64,          // folders count at the last space layout, to relayout as the scan grows
+    space_seen: u64,          // walk version at the last space layout, to relayout as the walk goes
+    space_growth: bool,       // disk map sized by what grew since the walk before
     // misc
     toast: Option<(String, bool, f64)>,
     kill_ask: Option<KillAsk>,
@@ -402,6 +436,10 @@ struct App {
     table_open: bool,    // the process list under the map
     settings_open: bool, // the settings sheet over the full view
     cfg: settings::Settings,
+    tl: Arc<Mutex<timeline::Timeline>>, // the last 24 h, filled by the sampler thread
+    alerts: Vec<timeline::Alert>,
+    time_at: Option<usize>,          // Some: the map and the table show this sample of the timeline
+    live_procs: Option<Arc<Vec<Proc>>>, // the live table, kept aside while looking at the past
 }
 
 impl App {
@@ -427,8 +465,12 @@ impl App {
             busy: true,
             hover_fire: false,
             hover: cfg.hover,
+            alerts: Vec::new(),
+            alerts_on: cfg.alerts,
+            mute: Vec::new(),
         }));
-        spawn_threads(sh.clone(), ctx.clone());
+        let tl = Arc::new(Mutex::new(timeline::Timeline::default()));
+        spawn_threads(sh.clone(), tl.clone(), ctx.clone());
         App {
             sh,
             hwnd: Some(hwnd),
@@ -467,6 +509,7 @@ impl App {
             scans: HashMap::new(),
             cores: sys::core_topology(),
             space_seen: 0,
+            space_growth: false,
             toast: None,
             kill_ask: None,
             startup: sys::startup_enabled(),
@@ -475,6 +518,10 @@ impl App {
             table_open: cfg.table_open,
             settings_open: false,
             cfg,
+            tl,
+            alerts: Vec::new(),
+            time_at: None,
+            live_procs: None,
         }
     }
 
@@ -557,6 +604,7 @@ impl App {
             let tot = (g.tot_seq != self.seq.0).then(|| (g.tot.clone(), g.hist.clone()));
             let procs = (g.procs_seq != self.seq.1).then(|| g.procs.clone()).flatten();
             self.seq = (g.tot_seq, g.procs_seq);
+            self.alerts = g.alerts.clone();
             (tot, procs, std::mem::take(&mut g.hover_fire))
         };
         if let Some((t, h)) = tot {
@@ -565,7 +613,11 @@ impl App {
         if let Some(p) = procs
             && self.mode == Mode::Full
         {
-            self.set_procs(p, now);
+            if self.time_at.is_some() {
+                self.live_procs = Some(p); // looking at the past: live data waits
+            } else {
+                self.set_procs(p, now);
+            }
         }
         if fire {
             self.go(if self.mode == Mode::Tab { Mode::Panel } else { Mode::Tab }, now);
@@ -578,6 +630,7 @@ impl App {
         g.bounds = self.bounds;
         g.busy = self.trans.is_some() || self.drag || !self.shown;
         g.hover = self.cfg.hover;
+        g.alerts_on = self.cfg.alerts;
         g.want_split = self.mode == Mode::Full && self.per_core && self.metric == Field::Cpu && self.space.is_none();
     }
 
@@ -642,39 +695,44 @@ impl App {
     /// Folders of the current one (each with its own subfolders inside), plus "Files" (directly in it) and,
     /// at the drive root, "Not scanned yet" (used space the scan has not reached) and, with Share of total,
     /// "Free". As the scan advances the scanned folders grow and the unscanned part shrinks.
+    /// With Changes on, folders are sized by what they gained since the walk before (only growth shows).
     fn space_layout(&mut self) -> Vec<Tile> {
         let Some(sv) = &self.space else { return Vec::new() };
         let g = sv.scan.tree.lock().unwrap();
+        let growth = self.space_growth && g.has_prev;
         let node = &g.nodes[sv.at as usize];
         let files_key = |id: u32| Key::Dir(id | 0x8000_0000); // "Files" of a folder: its own tile key
+        let delta = |n: &space::Node| if g.has_prev { n.total as f64 - n.prev as f64 } else { 0.0 };
+        let size = |n: &space::Node| if growth { delta(n).max(0.0) } else { n.total as f64 };
+        let item = |c: u32, children: Vec<treemap::Item>| {
+            let n = &g.nodes[c as usize];
+            treemap::Item { key: Key::Dir(c), hit: Some(Hit::Dir(c)), title: n.name.to_string(), value: size(n), free: false, delta: delta(n), children }
+        };
         let kid = |c: u32| {
             let n = &g.nodes[c as usize];
-            let mut children: Vec<treemap::Item> = n
-                .children
-                .iter()
-                .map(|&cc| treemap::Item { key: Key::Dir(cc), hit: Some(Hit::Dir(cc)), title: g.nodes[cc as usize].name.to_string(), value: g.nodes[cc as usize].total as f64, free: false, children: Vec::new() })
-                .collect();
-            if n.files > 0 && !children.is_empty() {
-                children.push(treemap::Item { key: files_key(c), hit: Some(Hit::Dir(c)), title: "Files".into(), value: n.files as f64, free: true, children: Vec::new() });
+            let mut children: Vec<treemap::Item> = n.children.iter().map(|&cc| item(cc, Vec::new())).collect();
+            if !growth && n.files > 0 && !children.is_empty() {
+                children.push(treemap::Item { key: files_key(c), hit: Some(Hit::Dir(c)), title: "Files".into(), value: n.files as f64, free: true, delta: 0.0, children: Vec::new() });
             }
-            treemap::Item { key: Key::Dir(c), hit: Some(Hit::Dir(c)), title: n.name.to_string(), value: n.total as f64, free: false, children }
+            item(c, children)
         };
         let mut items: Vec<treemap::Item> = node.children.iter().map(|&c| kid(c)).collect();
-        if node.files > 0 {
-            items.push(treemap::Item { key: files_key(sv.at), hit: None, title: "Files".into(), value: node.files as f64, free: true, children: Vec::new() });
+        if !growth && node.files > 0 {
+            items.push(treemap::Item { key: files_key(sv.at), hit: None, title: "Files".into(), value: node.files as f64, free: true, delta: 0.0, children: Vec::new() });
         }
-        if sv.at == 0 {
+        if sv.at == 0 && !growth {
             let missing = sv.used.saturating_sub(g.nodes[0].total);
             if g.scanned_at.is_none() && missing > 0 {
-                items.push(treemap::Item { key: Key::Part("Not scanned yet"), hit: None, title: "Not scanned yet".into(), value: missing as f64, free: true, children: Vec::new() });
+                items.push(treemap::Item { key: Key::Part("Not scanned yet"), hit: None, title: "Not scanned yet".into(), value: missing as f64, free: true, delta: 0.0, children: Vec::new() });
             }
             if self.relative {
-                items.push(treemap::Item { key: Key::Part("Free"), hit: None, title: "Free".into(), value: sv.total.saturating_sub(sv.used) as f64, free: true, children: Vec::new() });
+                items.push(treemap::Item { key: Key::Part("Free"), hit: None, title: "Free".into(), value: sv.total.saturating_sub(sv.used) as f64, free: true, delta: 0.0, children: Vec::new() });
             }
         }
         drop(g);
         treemap::nested(items, self.tm_size.x, self.tm_size.y, &mut self.sticky)
     }
+
 
     /// Open the disk space map of `drive` ("C:"), starting its scan if needed.
     fn open_space(&mut self, drive: &str, now: f64, ctx: &egui::Context) {
@@ -840,7 +898,7 @@ impl App {
                 _ => th().free,
             };
         }
-        if self.heat { heat_color(t.cpu) } else { mix(app_color(&t.name), th().bg, 0.25) }
+        if self.heat && self.space.is_none() { heat_color(t.cpu) } else { mix(app_color(&t.name), th().bg, 0.25) }
     }
 
     fn selected(&self) -> Vec<&Proc> {
@@ -1466,6 +1524,10 @@ impl App {
             p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 2.0, c);
             p.text(pos2(tr.center().x, tr.bottom() + 10.0), Align2::CENTER_CENTER, ic, icons(8.5), mix(c, th().muted, 0.25));
         }
+        // an alert shows as a dot on top of the tab, nothing more
+        if !self.alerts.is_empty() {
+            p.circle_filled(pos2(r.center().x + 2.0, r.top() + 7.0), 3.5, if self.alerts.iter().any(|a| a.critical) { DANGER } else { WARN });
+        }
         // hand on hover (it is a button); the move cursor only once it is held: a drag or a long press
         let resp = ui.interact(r, Id::unique("tab"), Sense::click_and_drag());
         let held = resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.press_start_time()).is_some_and(|t| now - t > 0.5);
@@ -1520,7 +1582,15 @@ impl App {
         let inner = Rect::from_min_max(r.min + vec2(12.0, 10.0), r.max - vec2(10.0, 4.0));
         let pt = ui.painter().clone();
         text(&pt, inner.left_top(), Align2::LEFT_TOP, "ResMon", bold(13.0), th().text, 100.0);
-        text(&pt, pos2(inner.right(), inner.top() + 2.0), Align2::RIGHT_TOP, "click for details", font(10.0), th().faint, 120.0);
+        match self.alerts.first() {
+            Some(a) => {
+                let c = if a.critical { DANGER } else { WARN };
+                text(&pt, pos2(inner.right(), inner.top() + 2.0), Align2::RIGHT_TOP, &a.text, bold(10.0), c, inner.width() - 70.0);
+            }
+            None => {
+                text(&pt, pos2(inner.right(), inner.top() + 2.0), Align2::RIGHT_TOP, "click for details", font(10.0), th().faint, 120.0);
+            }
+        }
         let gauges = self.gauges(true);
         let mut y = inner.top() + 26.0;
         for (_, g) in &gauges {
@@ -1586,14 +1656,30 @@ impl App {
         self.topbar(&mut ui, inner, now);
         let header = Rect::from_min_size(pos2(inner.left(), inner.top() + 42.0), vec2(inner.width(), 112.0));
         self.header(&ui, header, now);
-        let tb = Rect::from_min_size(pos2(inner.left(), header.bottom() + 10.0), vec2(inner.width(), 30.0));
+        // quiet alerts: at most two lines, under the cards
+        let mut top_y = header.bottom() + 10.0;
+        for a in self.alerts.clone().iter().take(2) {
+            let ar = Rect::from_min_size(pos2(inner.left(), top_y), vec2(inner.width(), 36.0));
+            self.alert_strip(&mut ui, ar, a, now);
+            top_y = ar.bottom() + 6.0;
+        }
+        let tb = Rect::from_min_size(pos2(inner.left(), top_y), vec2(inner.width(), 30.0));
         self.toolbar(&mut ui, tb, now);
         // the process list can be folded away: the map takes its room, the selection bar stays
         let rest = inner.bottom() - tb.bottom() - 10.0 - 40.0 - if self.table_open { 20.0 } else { 10.0 };
         let tm_h = if self.table_open { (rest * 0.6).floor() } else { rest };
         let tm = Rect::from_min_size(pos2(inner.left(), tb.bottom() + 10.0), vec2(inner.width(), tm_h));
         self.space_tick(now);
-        self.treemap(&mut ui, tm, now);
+        // the 24 h strip over the map, for the process views
+        let strip = self.cfg.history && self.space.is_none() && !(self.per_core && self.metric == Field::Cpu);
+        if strip {
+            let sr = Rect::from_min_size(tm.min, vec2(tm.width(), 74.0));
+            self.history_strip(&mut ui, sr, now);
+            let rest = Rect::from_min_max(pos2(tm.left(), sr.bottom() + 8.0), tm.max);
+            self.treemap(&mut ui, rest, now);
+        } else {
+            self.treemap(&mut ui, tm, now);
+        }
         let sb = Rect::from_min_size(pos2(inner.left(), tm.bottom() + 10.0), vec2(inner.width(), 40.0));
         self.selbar(&mut ui, sb, now);
         if self.table_open {
@@ -1739,10 +1825,24 @@ impl App {
             format!("{by}  ·  {n} apps · {} processes", self.procs.len())
         };
         tu.add_space(8.0);
+        let past = self.time_at.and_then(|i| self.tl.lock().unwrap().snaps.get(i).map(|s| s.t));
+        if let Some(t) = past {
+            tu.label(egui::RichText::new(format!("At {}", sys::fmt_started(t))).font(bold(12.0)).color(ac().cpu));
+            if link(&mut tu, "Back to live", th().text, 12.0).clicked() {
+                self.back_to_live(now);
+            }
+        }
         tu.label(egui::RichText::new(count).font(font(12.0)).color(th().faint));
         tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
             tu.spacing_mut().item_spacing.x = 8.0;
             let cores_view = self.per_core && self.metric == Field::Cpu;
+            if !cores_view && pills(tu, &[("\u{23F2}  History", self.cfg.history)]).is_some() {
+                self.cfg.history = !self.cfg.history;
+                if !self.cfg.history && self.time_at.is_some() {
+                    self.back_to_live(now);
+                }
+                let _ = self.save_settings();
+            }
             // only the buttons that mean something for this view
             let glyph = if self.table_open { "\u{E70D}" } else { "\u{E70E}" }; // chevron down / up
             if icon_button(tu, glyph, if self.table_open { "Hide the process list" } else { "Show the process list" }, th().muted).clicked() {
@@ -1817,9 +1917,15 @@ impl App {
                 self.table_open = !self.table_open;
                 let _ = self.save_settings();
             }
-            if pills(tu, &[("Share of total", self.relative)]).is_some() {
+            if !self.space_growth && pills(tu, &[("Share of total", self.relative)]).is_some() {
                 self.relative = !self.relative;
                 let _ = self.save_settings();
+                self.relayout(now);
+            }
+            // after a refresh: size the folders by what they gained since the walk before
+            let has_prev = self.space.as_ref().is_some_and(|s| s.scan.tree.lock().unwrap().has_prev);
+            if has_prev && pills(tu, &[("+  Changes", self.space_growth)]).is_some() {
+                self.space_growth = !self.space_growth;
                 self.relayout(now);
             }
             // the drive is read from the cache; walking it again happens only when asked
@@ -1950,7 +2056,12 @@ impl App {
             let tr = r4(self.shown_rect(&t.key, now).unwrap_or(t.rect), o);
             rects.push(tr);
             let c = self.tile_color(t);
-            let value = self.fmt_metric(t.value);
+            let mut value = self.fmt_metric(t.value);
+            if self.space.is_some() && t.cpu.abs() >= 50e6 {
+                // the disk map: what this folder gained or lost since the walk before
+                let d = format!("{}{}", if t.cpu > 0.0 { "+" } else { "\u{2212}" }, fmt_bytes(t.cpu.abs()));
+                value = if self.space_growth { d } else { format!("{value}  \u{b7}  {d}") };
+            }
             if t.header {
                 // a group frame: dark, its processes sit on top
                 p.rect_filled(tr, 3.0, mix(c, th().bg, 0.55));
@@ -2107,22 +2218,24 @@ impl App {
     /// Disk space map: the folders shown, biggest first.
     fn space_table(&mut self, ui: &mut Ui, r: Rect, now: f64) {
         let Some(sv) = &self.space else { return };
-        let rows: Vec<(u32, String, u64, u64, usize)> = {
+        let growth = self.space_growth;
+        let rows: Vec<(u32, String, u64, u64, usize, i64)> = {
             let g = sv.scan.tree.lock().unwrap();
             let mut v: Vec<_> = g.nodes[sv.at as usize]
                 .children
                 .iter()
                 .map(|&c| {
                     let n = &g.nodes[c as usize];
-                    (c, n.name.to_string(), n.total, n.files, n.children.len())
+                    let d = if g.has_prev { n.total as i64 - n.prev as i64 } else { 0 };
+                    (c, n.name.to_string(), n.total, n.files, n.children.len(), d)
                 })
                 .collect();
-            v.sort_by(|a, b| b.2.cmp(&a.2));
+            if growth { v.sort_by(|a, b| b.5.cmp(&a.5)) } else { v.sort_by(|a, b| b.2.cmp(&a.2)) }
             v
         };
         let parent: u64 = rows.iter().map(|r| r.2).sum::<u64>().max(1);
         let mut tu = ui.new_child(UiBuilder::new().max_rect(r).layout(Layout::top_down(Align::Min)));
-        let cols: [(&str, f32, bool); 5] = [("Folder", 300.0, false), ("Size", 100.0, true), ("Share", 80.0, true), ("Files here", 100.0, true), ("Subfolders", 100.0, true)];
+        let cols: [(&str, f32, bool); 6] = [("Folder", 300.0, false), ("Size", 100.0, true), ("Change", 110.0, true), ("Share", 80.0, true), ("Files here", 100.0, true), ("Subfolders", 100.0, true)];
         let (hr, _) = tu.allocate_exact_size(vec2(r.width(), 24.0), Sense::hover());
         let mut x = r.left();
         for (label, w, num) in cols {
@@ -2138,7 +2251,7 @@ impl App {
         };
         let (mut clicked, mut open) = (None, None);
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(&mut tu, 26.0, rows.len(), |ui, range| {
-            for (id, name, total, files, kids) in &rows[range] {
+            for (id, name, total, files, kids, d) in &rows[range] {
                 let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
                 if sel == Some(*id) {
                     ui.painter().rect_filled(rr, 6.0, th().row_sel);
@@ -2151,7 +2264,8 @@ impl App {
                 if resp.double_clicked() {
                     open = Some(*id);
                 }
-                let vals = [name.clone(), fmt_bytes(*total as f64), format!("{:.1}%", *total as f64 / parent as f64 * 100.0), fmt_bytes(*files as f64), kids.to_string()];
+                let change = if *d == 0 { "-".to_string() } else { format!("{}{}", if *d > 0 { "+" } else { "\u{2212}" }, fmt_bytes(d.unsigned_abs() as f64)) };
+                let vals = [name.clone(), fmt_bytes(*total as f64), change, format!("{:.1}%", *total as f64 / parent as f64 * 100.0), fmt_bytes(*files as f64), kids.to_string()];
                 let mut x = rr.left();
                 for (c, ((_, w, num), v)) in cols.iter().zip(vals).enumerate() {
                     let (pos, al) = if *num { (pos2(x + w - 6.0, rr.center().y), Align2::RIGHT_CENTER) } else { (pos2(x + 6.0, rr.center().y), Align2::LEFT_CENTER) };
@@ -2299,7 +2413,7 @@ impl App {
                     if q.io_w >= 102400.0 { fmt_rate(q.io_w) } else { "-".into() },
                     if q.net_d >= 1024.0 { fmt_rate(q.net_d) } else { "-".into() },
                     if q.net_u >= 1024.0 { fmt_rate(q.net_u) } else { "-".into() },
-                    q.threads.to_string(),
+                    if q.threads > 0 { q.threads.to_string() } else { "-".into() }, // 0: a sample from the past, not kept
                     sys::fmt_started(q.create),
                     q.cmd.clone(),
                 ];
@@ -2313,6 +2427,189 @@ impl App {
         });
         if let Some(pid) = clicked {
             self.sel = Some(Hit::Pid(pid));
+        }
+    }
+
+    /// One alert under the cards: what happened, who did it, and what can be done.
+    fn alert_strip(&mut self, ui: &mut Ui, r: Rect, a: &timeline::Alert, now: f64) {
+        let c = if a.critical { DANGER } else { WARN };
+        let p = ui.painter();
+        p.rect(r, 10.0, mix(c, th().bg, 0.86), Stroke::new(1.0, alpha(c, 0x70)), StrokeKind::Inside);
+        p.text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, "\u{E7BA}", icons(14.0), c); // warning
+        text(p, pos2(r.left() + 36.0, r.center().y), Align2::LEFT_CENTER, &a.text, font(12.5), th().text, r.width() - 420.0);
+        let mut au = ui.new_child(UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
+        if link(&mut au, "Mute 30 min", th().muted, 12.0).clicked() {
+            self.sh.lock().unwrap().mute.push(a.kind.to_string());
+            self.alerts.retain(|x| x.kind != a.kind);
+        }
+        if let Some(pid) = a.pid {
+            let name = self.by_pid.get(&pid).map(|&i| self.procs[i].name.clone()).unwrap_or_else(|| format!("PID {pid}"));
+            if link(&mut au, "End task", DANGER, 12.0).clicked() {
+                self.kill_ask = Some(KillAsk { pids: vec![pid], what: format!("{name} (PID {pid})"), me: pid == std::process::id(), tree: false });
+            }
+            if link(&mut au, "Lower priority", th().muted, 12.0).clicked() {
+                let ok = sys::set_priority(pid, sys::PRIORITIES[1].1);
+                self.toast(if ok { format!("{name} set to below normal priority") } else { format!("Cannot change the priority of {name}") }, !ok, now);
+            }
+            if link(&mut au, "Show", th().muted, 12.0).clicked() {
+                self.sel = Some(Hit::Pid(pid));
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- the last 24 hours
+
+    /// Show sample i of the timeline in the map and the table (live data waits aside).
+    fn view_past(&mut self, i: usize, now: f64) {
+        let past = Arc::new(self.tl.lock().unwrap().procs_at(i));
+        if self.time_at.is_none() {
+            self.live_procs = Some(self.procs.clone());
+        }
+        self.time_at = Some(i);
+        self.set_procs(past, now);
+        self.relayout(now);
+    }
+
+    fn back_to_live(&mut self, now: f64) {
+        self.time_at = None;
+        if let Some(p) = self.live_procs.take() {
+            self.set_procs(p, now);
+        }
+        self.relayout(now);
+    }
+
+    /// Which machine total and colour go with the current measure.
+    fn metric_total(&self) -> (usize, Color32) {
+        match self.metric {
+            Field::Cpu => (0, ac().cpu),
+            Field::Ws => (1, ac().ram),
+            Field::Private => (2, ac().commit),
+            Field::Gpu => (3, ac().gpu),
+            Field::GpuMem => (4, ac().vram),
+            Field::IoRead | Field::IoWrite => (5, ac().disk),
+            Field::NetDown | Field::NetUp => (7, ac().net),
+        }
+    }
+
+    fn fmt_total(&self, k: usize, v: f32) -> String {
+        match k {
+            0 | 3 => format!("{v:.0}%"),
+            1 | 2 | 4 => fmt_bytes(v as f64),
+            _ => fmt_rate(v as f64),
+        }
+    }
+
+    /// The 24 h strip over the map: the machine total of the current measure, its peaks named after the
+    /// process that caused them; click to see the map at that moment.
+    fn history_strip(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        let p = ui.painter().with_clip_rect(r);
+        p.rect_filled(r, 10.0, th().tm_bg);
+        let (k, color) = self.metric_total();
+        let field = self.metric;
+        let tl = self.tl.clone();
+        let g = tl.lock().unwrap();
+        let n = g.snaps.len();
+        if n < 2 {
+            p.text(r.center(), Align2::CENTER_CENTER, "The history fills in: one sample every 10 s, the last 24 h are kept", font(12.0), th().faint);
+            return;
+        }
+        let plot = Rect::from_min_max(r.min + vec2(10.0, 8.0), r.max - vec2(10.0, 18.0));
+        let (t0, t1) = (g.snaps[0].t, timeline::now_unix().max(g.snaps[n - 1].t + 1));
+        let x_of = |t: i64| plot.left() + (t - t0) as f32 / (t1 - t0) as f32 * plot.width();
+        let mut top = g.snaps.iter().map(|s| s.tot[k]).fold(0.0f32, f32::max);
+        if k == 0 || k == 3 {
+            top = 100.0;
+        } else if k == 1 {
+            top = self.tot.as_ref().map_or(top, |t| t.ram_total as f32);
+        } else if k == 2 {
+            top = self.tot.as_ref().map_or(top, |t| t.commit_limit as f32);
+        } else if k == 4 {
+            top = self.tot.as_ref().map_or(top, |t| t.gpu.mem_total as f32).max(1.0);
+        }
+        let top = top.max(1.0);
+        let y_of = |v: f32| plot.bottom() - (v / top).clamp(0.0, 1.0) * plot.height();
+        // one point per pixel column (the highest sample in it), filled under the line
+        let cols = plot.width().max(2.0) as usize;
+        let mut best: Vec<Option<(f32, usize)>> = vec![None; cols + 1];
+        for (i, s) in g.snaps.iter().enumerate() {
+            let c = ((x_of(s.t) - plot.left()) as usize).min(cols);
+            if best[c].is_none_or(|(v, _)| s.tot[k] > v) {
+                best[c] = Some((s.tot[k], i));
+            }
+        }
+        let pts: Vec<Pos2> = best.iter().enumerate().filter_map(|(c, b)| b.map(|(v, _)| pos2(plot.left() + c as f32, y_of(v)))).collect();
+        if pts.len() >= 2 {
+            let mut m = egui::Mesh::default();
+            for (i, q) in pts.iter().enumerate() {
+                m.colored_vertex(*q, alpha(color, 0x50));
+                m.colored_vertex(pos2(q.x, plot.bottom()), alpha(color, 0x08));
+                if i > 0 {
+                    let j = (2 * i) as u32;
+                    m.add_triangle(j - 2, j - 1, j);
+                    m.add_triangle(j - 1, j, j + 1);
+                }
+            }
+            p.add(Shape::mesh(m));
+            p.add(Shape::line(pts, Stroke::new(1.4, color)));
+        }
+        // the peaks, each named after its culprit
+        // a peak is a sample well above the usual level: a flat line (memory, say) gets no labels
+        let mean = g.snaps.iter().map(|s| s.tot[k]).sum::<f32>() / n as f32;
+        let sd = (g.snaps.iter().map(|s| (s.tot[k] - mean).powi(2)).sum::<f32>() / n as f32).sqrt();
+        let bar = (mean + 1.5 * sd).max(mean * 1.1).max(top * 0.15);
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| g.snaps[b].tot[k].total_cmp(&g.snaps[a].tot[k]));
+        let mut marks: Vec<f32> = Vec::new();
+        for i in order {
+            if marks.len() >= 5 || g.snaps[i].tot[k] < bar {
+                break;
+            }
+            let x = x_of(g.snaps[i].t);
+            if marks.iter().any(|&m| (m - x).abs() < 90.0) {
+                continue;
+            }
+            marks.push(x);
+            let y = y_of(g.snaps[i].tot[k]);
+            p.circle_filled(pos2(x, y), 3.0, color);
+            if let Some((name, _)) = g.culprit(i, field) {
+                let lx = x.clamp(plot.left() + 40.0, plot.right() - 40.0);
+                text(&p, pos2(lx, (y - 9.0).max(plot.top() + 6.0)), Align2::CENTER_CENTER, name, bold(10.0), th().text, 120.0);
+            }
+        }
+        // time axis
+        let clock = |t: i64| sys::fmt_started(t).chars().rev().take(5).collect::<String>().chars().rev().collect::<String>();
+        text(&p, pos2(plot.left(), r.bottom() - 8.0), Align2::LEFT_CENTER, &clock(t0), font(10.0), th().faint, 80.0);
+        text(&p, pos2(plot.right(), r.bottom() - 8.0), Align2::RIGHT_CENTER, "now", font(10.0), th().faint, 80.0);
+        // the moment being shown
+        let at_x = self.time_at.and_then(|i| g.snaps.get(i)).map(|s| x_of(s.t));
+        if let Some(x) = at_x {
+            p.line_segment([pos2(x, plot.top()), pos2(x, plot.bottom())], Stroke::new(2.0, th().text));
+        }
+        // hover and click
+        let resp = ui.interact(r, Id::unique("history"), Sense::click());
+        let mut pick = None;
+        if let Some(pos) = resp.hover_pos() {
+            let t = t0 + (((pos.x - plot.left()) / plot.width()).clamp(0.0, 1.0) * (t1 - t0) as f32) as i64;
+            let i = g.snaps.partition_point(|s| s.t < t).min(n - 1);
+            let s = &g.snaps[i];
+            let x = x_of(s.t);
+            p.line_segment([pos2(x, plot.top()), pos2(x, plot.bottom())], Stroke::new(1.0, alpha(th().text, 0x80)));
+            let who = g.culprit(i, field).map(|(nm, _)| format!("  ·  {nm}")).unwrap_or_default();
+            let label = format!("{}  ·  {}{who}", clock(s.t), self.fmt_total(k, s.tot[k]));
+            let lx = if x > plot.center().x { x - 8.0 } else { x + 8.0 };
+            let al = if x > plot.center().x { Align2::RIGHT_TOP } else { Align2::LEFT_TOP };
+            let gl = p.layout_no_wrap(label, font(11.0), th().text);
+            let br = al.anchor_size(pos2(lx, plot.top()), gl.size() + vec2(12.0, 6.0));
+            p.rect_filled(br, 6.0, th().raised);
+            p.galley(br.min + vec2(6.0, 3.0), gl, th().text);
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            if resp.clicked() {
+                pick = Some(i);
+            }
+        }
+        drop(g);
+        if let Some(i) = pick {
+            self.view_past(i, now);
         }
     }
 
@@ -2419,6 +2716,12 @@ impl App {
                     }
                 });
             });
+            if toggle(ui, &mut self.cfg.alerts, "Quiet alerts", "Memory, commit, VRAM, GPU temperature, CPU held high, a drive almost full: a dot on the tab, no pop-ups") {
+                changed = true;
+            }
+            if toggle(ui, &mut self.cfg.history, "History strip", "The last 24 h over the map; click a moment to see it") {
+                changed = true;
+            }
             if toggle(ui, &mut self.table_open, "Process list", "Under the map; the arrow in the toolbar folds it too") {
                 changed = true;
             }

@@ -221,6 +221,7 @@ pub struct Item {
     pub title: String,
     pub value: f64,
     pub free: bool,
+    pub delta: f64, // disk map: bytes gained (or lost) since the walk before; carried in Tile::cpu
     pub children: Vec<Item>,
 }
 
@@ -248,7 +249,7 @@ pub fn nested(items: Vec<Item>, w: f32, h: f32, sticky: &mut Sticky) -> Vec<Tile
         title: it.title.clone(),
         value: it.value,
         name: it.title.clone(),
-        cpu: 0.0,
+        cpu: it.delta,
         header,
         free: it.free,
     };

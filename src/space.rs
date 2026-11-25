@@ -26,6 +26,7 @@ pub struct Node {
     pub parent: u32,
     pub files: u64, // bytes of the files directly in this folder
     pub total: u64, // files + everything below (running while walking)
+    pub prev: u64,  // total when the last refresh began: total - prev is what changed (0 for new folders)
     pub children: Vec<u32>,
 }
 
@@ -37,6 +38,7 @@ pub struct Tree {
     pub scanned_at: Option<u64>,  // unix seconds of the last complete walk
     pub took: Option<f64>,        // seconds the last walk took
     pub version: u64,             // bumps on every change: the map relayouts when it moves
+    pub has_prev: bool,           // a refresh of an earlier walk: changes can be shown
     started: Instant,
 }
 
@@ -97,13 +99,14 @@ impl Scan {
         // no cache, or one saved half-way through a first walk: walk (again); the map shows what is known meanwhile
         let fresh = cached.as_ref().is_none_or(|t| t.scanned_at.is_none());
         let tree = cached.unwrap_or_else(|| Tree {
-            nodes: vec![Node { name: root.into(), parent: 0, files: 0, total: 0, children: Vec::new() }],
+            nodes: vec![Node { name: root.into(), parent: 0, files: 0, total: 0, prev: 0, children: Vec::new() }],
             running: false,
             checked: 0,
             denied: 0,
             scanned_at: None,
             took: None,
             version: 0,
+            has_prev: false,
             started: Instant::now(),
         });
         let s = Scan { root: root.to_string(), tree: Arc::new(Mutex::new(tree)), stop: Arc::new(AtomicBool::new(false)) };
@@ -121,6 +124,11 @@ impl Scan {
                 return;
             }
             (g.running, g.checked, g.denied, g.started) = (true, 0, 0, Instant::now());
+            // what the drive held before this walk: the map can show what grew or shrank since
+            g.has_prev = g.scanned_at.is_some();
+            for n in &mut g.nodes {
+                n.prev = n.total;
+            }
         }
         let (t, stop, root) = (self.tree.clone(), self.stop.clone(), self.root.clone());
         std::thread::spawn(move || {
@@ -157,7 +165,7 @@ impl Scan {
                         Some(&c) => keep.push(c),
                         None => {
                             let nid = g.nodes.len() as u32;
-                            g.nodes.push(Node { name: name.into(), parent: id, files: 0, total: 0, children: Vec::new() });
+                            g.nodes.push(Node { name: name.into(), parent: id, files: 0, total: 0, prev: 0, children: Vec::new() });
                             keep.push(nid);
                             changed = true;
                         }
@@ -239,14 +247,16 @@ fn save(root: &str, g: &Tree) -> std::io::Result<()> {
     let new_id: HashMap<u32, u32> = order.iter().enumerate().map(|(k, &id)| (id, k as u32)).collect();
     let tmp = p.with_extension("tmp");
     let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
-    w.write_all(b"RMS1")?;
+    w.write_all(b"RMS2")?;
     w.write_all(&g.scanned_at.unwrap_or(0).to_le_bytes())?;
     w.write_all(&g.took.unwrap_or(0.0).to_le_bytes())?;
     w.write_all(&(order.len() as u32).to_le_bytes())?;
+    w.write_all(&[g.has_prev as u8])?;
     for &id in &order {
         let n = &g.nodes[id as usize];
         w.write_all(&new_id[&n.parent].to_le_bytes())?;
         w.write_all(&n.files.to_le_bytes())?;
+        w.write_all(&n.prev.to_le_bytes())?;
         let name = n.name.as_bytes();
         w.write_all(&(name.len() as u16).to_le_bytes())?;
         w.write_all(name)?;
@@ -262,7 +272,8 @@ fn load(root: &str) -> Option<Tree> {
     let mut b4 = [0u8; 4];
     let mut b2 = [0u8; 2];
     r.read_exact(&mut b4).ok()?;
-    if &b4 != b"RMS1" {
+    let v2 = &b4 == b"RMS2"; // RMS2 adds what each folder held before the last refresh
+    if !v2 && &b4 != b"RMS1" {
         return None;
     }
     r.read_exact(&mut b8).ok()?;
@@ -271,16 +282,27 @@ fn load(root: &str) -> Option<Tree> {
     let took = f64::from_le_bytes(b8);
     r.read_exact(&mut b4).ok()?;
     let count = u32::from_le_bytes(b4) as usize;
+    let mut b1 = [0u8; 1];
+    if v2 {
+        r.read_exact(&mut b1).ok()?;
+    }
+    let has_prev = b1[0] == 1;
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
         r.read_exact(&mut b4).ok()?;
         let parent = u32::from_le_bytes(b4);
         r.read_exact(&mut b8).ok()?;
         let files = u64::from_le_bytes(b8);
+        let prev = if v2 {
+            r.read_exact(&mut b8).ok()?;
+            u64::from_le_bytes(b8)
+        } else {
+            0
+        };
         r.read_exact(&mut b2).ok()?;
         let mut name = vec![0u8; u16::from_le_bytes(b2) as usize];
         r.read_exact(&mut name).ok()?;
-        nodes.push(Node { name: String::from_utf8(name).ok()?.into(), parent, files, total: files, children: Vec::new() });
+        nodes.push(Node { name: String::from_utf8(name).ok()?.into(), parent, files, total: files, prev, children: Vec::new() });
     }
     // children lists, then totals bottom-up (parents always come before their children)
     for id in (1..nodes.len()).rev() {
@@ -291,7 +313,7 @@ fn load(root: &str) -> Option<Tree> {
     for n in &mut nodes {
         n.children.reverse();
     }
-    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: (scanned_at > 0).then_some(scanned_at), took: Some(took), version: 1, started: Instant::now() })
+    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: (scanned_at > 0).then_some(scanned_at), took: Some(took), version: 1, has_prev, started: Instant::now() })
 }
 
 #[cfg(test)]
@@ -349,6 +371,12 @@ mod tests {
         let names: Vec<&str> = g.nodes[0].children.iter().map(|&c| &*g.nodes[c as usize].name).collect();
         assert!(names.contains(&"d") && !names.contains(&"c"), "{names:?}");
         assert_eq!(g.nodes[0].children.iter().find(|&&c| &*g.nodes[c as usize].name == "a").copied(), a_cached);
+        // what changed since the walk before: a grew by 700 bytes, d is new
+        assert!(g.has_prev);
+        let a_now = &g.nodes[a_cached.unwrap() as usize];
+        assert_eq!(a_now.total as i64 - a_now.prev as i64, 700);
+        let d = g.nodes[0].children.iter().map(|&c| &g.nodes[c as usize]).find(|n| &*n.name == "d").unwrap();
+        assert_eq!((d.prev, d.total), (0, 40));
         let _ = a;
         drop(g);
         drop(s);
