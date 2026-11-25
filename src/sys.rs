@@ -309,8 +309,50 @@ pub fn set_priority(pid: u32, class: PROCESS_CREATION_FLAGS) -> bool {
     open(pid, PROCESS_SET_INFORMATION).map(Handle).is_some_and(|h| unsafe { SetPriorityClass(h.0, class) }.is_ok())
 }
 
-pub const PRIORITIES: [(&str, PROCESS_CREATION_FLAGS); 3] =
-    [("Idle", IDLE_PRIORITY_CLASS), ("Below normal", BELOW_NORMAL_PRIORITY_CLASS), ("Normal", NORMAL_PRIORITY_CLASS)];
+pub const PRIORITIES: [(&str, PROCESS_CREATION_FLAGS); 5] = [
+    ("Idle", IDLE_PRIORITY_CLASS),
+    ("Below normal", BELOW_NORMAL_PRIORITY_CLASS),
+    ("Normal", NORMAL_PRIORITY_CLASS),
+    ("Above normal", ABOVE_NORMAL_PRIORITY_CLASS),
+    ("High", HIGH_PRIORITY_CLASS),
+];
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtSuspendProcess(h: HANDLE) -> i32;
+    fn NtResumeProcess(h: HANDLE) -> i32;
+}
+
+/// Freeze (or thaw) every thread of a process: a training run paused while the machine is needed, then
+/// resumed where it was. True if it worked.
+pub fn suspend(pid: u32, on: bool) -> bool {
+    let Some(h) = open(pid, PROCESS_SUSPEND_RESUME).map(Handle) else { return false };
+    (unsafe { if on { NtSuspendProcess(h.0) } else { NtResumeProcess(h.0) } }) == 0
+}
+
+/// Ask the shell to do `verb` on `target` ("open" a folder or URL, "properties" of a file or folder).
+pub fn shell(verb: &str, target: &str) -> bool {
+    use windows::Win32::UI::Shell::{SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW};
+    let (v, t) = (HSTRING::from(verb), HSTRING::from(target));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST, // needed for "properties"
+        lpVerb: PCWSTR(v.as_ptr()),
+        lpFile: PCWSTR(t.as_ptr()),
+        nShow: 1, // SW_SHOWNORMAL
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }.is_ok()
+}
+
+/// A terminal in `dir`: Windows Terminal if there is one, otherwise PowerShell.
+pub fn terminal(dir: &str) {
+    use std::os::windows::process::CommandExt;
+    let wt = std::process::Command::new("wt.exe").args(["-d", dir]).spawn();
+    if wt.is_err() {
+        let _ = std::process::Command::new("powershell.exe").args(["-NoExit", "-Command", "Set-Location -LiteralPath $args[0]", dir]).creation_flags(0x10).spawn();
+    }
+}
 
 /// [(mount, used, total)] for local volumes that are ready (empty card readers and CD drives are skipped).
 pub fn drives() -> Vec<(String, u64, u64)> {
@@ -405,6 +447,12 @@ pub struct Gpu {
     pub power: Option<f32>,
     pub mem_used: u64,
     pub mem_total: u64,
+    pub power_limit: Option<f32>,     // W, the cap the driver enforces
+    pub clock: Option<(u32, u32)>,    // graphics MHz now, max
+    pub mem_clock: Option<u32>,       // MHz
+    pub fan: Option<u32>,             // %
+    pub pcie: Option<(u32, u32, u32)>, // gen, width now, max width
+    pub throttle: Vec<&'static str>,  // why the clocks are held down (idle and app settings left out)
 }
 
 struct Nvml {
@@ -427,6 +475,29 @@ impl Nvml {
             g.power = d.power_usage().ok().map(|mw| mw as f32 / 1000.0);
             if let Ok(m) = d.memory_info() {
                 (g.mem_used, g.mem_total) = (m.used, m.total);
+            }
+            use nvml_wrapper::bitmasks::device::ThrottleReasons as T;
+            use nvml_wrapper::enum_wrappers::device::Clock;
+            g.power_limit = d.enforced_power_limit().ok().map(|mw| mw as f32 / 1000.0);
+            g.clock = d.clock_info(Clock::Graphics).ok().zip(d.max_clock_info(Clock::Graphics).ok());
+            g.mem_clock = d.clock_info(Clock::Memory).ok();
+            g.fan = d.fan_speed(0).ok();
+            g.pcie = match (d.current_pcie_link_gen(), d.current_pcie_link_width(), d.max_pcie_link_width()) {
+                (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+                _ => None,
+            };
+            if let Ok(r) = d.current_throttle_reasons() {
+                for (flag, why) in [
+                    (T::SW_POWER_CAP, "power cap"),
+                    (T::SW_THERMAL_SLOWDOWN, "thermal"),
+                    (T::HW_THERMAL_SLOWDOWN, "thermal (hardware)"),
+                    (T::HW_SLOWDOWN, "hardware slowdown"),
+                    (T::HW_POWER_BRAKE_SLOWDOWN, "power brake"),
+                ] {
+                    if r.contains(flag) {
+                        g.throttle.push(why);
+                    }
+                }
             }
         }
         g
@@ -460,6 +531,7 @@ pub struct Proc {
     pub pid: u32,
     pub ppid: u32,
     pub name: String,
+    pub group: String, // what the map groups it under: its name, or its family (the process that launched the job)
     pub threads: u32,
     pub ws: f64,
     pub private: f64,
@@ -728,6 +800,7 @@ impl Sampler {
                     gpu_mem: gmem.get(&r.pid).copied().unwrap_or(0.0),
                     gpu: gutil.get(&r.pid).copied().unwrap_or(0.0),
                     cmd,
+                    group: r.name.clone(),
                     name: r.name,
                 }
             })

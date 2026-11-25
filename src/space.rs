@@ -39,6 +39,7 @@ pub struct Tree {
     pub took: Option<f64>,        // seconds the last walk took
     pub version: u64,             // bumps on every change: the map relayouts when it moves
     pub has_prev: bool,           // a refresh of an earlier walk: changes can be shown
+    pub virtual_root: bool,       // the root is a list of folders (ML storage), not a drive
     started: Instant,
 }
 
@@ -54,11 +55,27 @@ impl Tree {
             id = n.parent;
         }
         parts.reverse();
+        if self.virtual_root {
+            parts.remove(0); // "ML storage" is not on disk: its children are full paths
+        }
         let mut p = parts.join("\\");
-        if parts.len() == 1 && !p.ends_with('\\') {
-            p.push('\\');
+        if parts.len() == 1 && !p.ends_with('\\') && p.len() <= 3 {
+            p.push('\\'); // a drive root
         }
         p
+    }
+
+    /// What to call a folder in the map: its name, or for the folders of a virtual root a short path
+    /// ("huggingface", "anaconda3\pkgs") since their names are full paths.
+    pub fn label(&self, id: u32) -> String {
+        let n = &self.nodes[id as usize];
+        if !(self.virtual_root && id != 0 && n.parent == 0) {
+            return n.name.to_string();
+        }
+        let parts: Vec<&str> = n.name.split('\\').filter(|s| !s.is_empty()).collect();
+        let last = parts.last().copied().unwrap_or("");
+        let generic = ["models", "pkgs", "cache", "hub", "datasets"].contains(&last.to_lowercase().as_str());
+        if generic && parts.len() >= 2 { format!("{}\\{last}", parts[parts.len() - 2]) } else { last.to_string() }
     }
 
 
@@ -107,6 +124,7 @@ impl Scan {
             took: None,
             version: 0,
             has_prev: false,
+            virtual_root: false,
             started: Instant::now(),
         });
         let s = Scan { root: root.to_string(), tree: Arc::new(Mutex::new(tree)), stop: Arc::new(AtomicBool::new(false)) };
@@ -116,8 +134,52 @@ impl Scan {
         s
     }
 
+    /// A list of folders shown as one drive named `name` (ML storage): same cache, walk and changes.
+    pub fn open_many(name: &str, folders: &[String], tick: impl Fn() + Send + 'static) -> Scan {
+        let mut tree = load(name).unwrap_or_else(|| Tree {
+            nodes: vec![Node { name: name.into(), parent: 0, files: 0, total: 0, prev: 0, children: Vec::new() }],
+            running: false,
+            checked: 0,
+            denied: 0,
+            scanned_at: None,
+            took: None,
+            version: 0,
+            has_prev: false,
+            virtual_root: true,
+            started: Instant::now(),
+        });
+        tree.virtual_root = true;
+        // the list may have changed since the cache was saved: drop what is gone, add what is new
+        let mut added = false;
+        let gone: Vec<u32> = tree.nodes[0].children.iter().copied().filter(|&c| !folders.iter().any(|f| *f == *tree.nodes[c as usize].name)).collect();
+        for c in gone {
+            let t = tree.nodes[c as usize].total;
+            tree.nodes[0].total = tree.nodes[0].total.saturating_sub(t);
+            tree.nodes[0].children.retain(|&x| x != c);
+        }
+        for f in folders {
+            if !tree.nodes[0].children.iter().any(|&c| *tree.nodes[c as usize].name == **f) {
+                let id = tree.nodes.len() as u32;
+                tree.nodes.push(Node { name: f.as_str().into(), parent: 0, files: 0, total: 0, prev: 0, children: Vec::new() });
+                tree.nodes[0].children.push(id);
+                added = true;
+            }
+        }
+        let fresh = tree.scanned_at.is_none() || added;
+        let s = Scan { root: name.to_string(), tree: Arc::new(Mutex::new(tree)), stop: Arc::new(AtomicBool::new(false)) };
+        if fresh {
+            s.refresh(tick);
+        }
+        s
+    }
+
     /// Walk the drive again, changing only what changed. Does nothing if a walk is running.
     pub fn refresh(&self, tick: impl Fn() + Send + 'static) {
+        self.refresh_from(0, tick);
+    }
+
+    /// Walk one folder and everything below it again (right click > Refresh this folder).
+    pub fn refresh_from(&self, start: u32, tick: impl Fn() + Send + 'static) {
         {
             let mut g = self.tree.lock().unwrap();
             if g.running {
@@ -133,14 +195,23 @@ impl Scan {
         let (t, stop, root) = (self.tree.clone(), self.stop.clone(), self.root.clone());
         std::thread::spawn(move || {
             let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) }; // low I/O priority too
-            let mut queue = VecDeque::from([0u32]);
+            let mut queue = VecDeque::from([start]);
             let (mut last_tick, mut last_save) = (Instant::now(), Instant::now());
             while let Some(id) = queue.pop_front() {
                 if stop.load(Ordering::Relaxed) {
                     t.lock().unwrap().running = false;
                     return;
                 }
-                let path = t.lock().unwrap().path(id);
+                let (path, is_virtual) = {
+                    let g = t.lock().unwrap();
+                    (g.path(id), id == 0 && g.virtual_root)
+                };
+                if is_virtual {
+                    // a list of folders shown as one drive: the root is not on disk, its children are
+                    let g = t.lock().unwrap();
+                    queue.extend(g.nodes[0].children.iter().copied());
+                    continue;
+                }
                 let (files, dirs, ok) = list(&path);
                 let mut g = t.lock().unwrap();
                 g.checked += 1;
@@ -313,7 +384,7 @@ fn load(root: &str) -> Option<Tree> {
     for n in &mut nodes {
         n.children.reverse();
     }
-    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: (scanned_at > 0).then_some(scanned_at), took: Some(took), version: 1, has_prev, started: Instant::now() })
+    Some(Tree { nodes, running: false, checked: 0, denied: 0, scanned_at: (scanned_at > 0).then_some(scanned_at), took: Some(took), version: 1, has_prev, virtual_root: false, started: Instant::now() })
 }
 
 #[cfg(test)]
@@ -325,6 +396,32 @@ mod tests {
         while s.tree.lock().unwrap().running && t0.elapsed().as_secs() < 10 {
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_list_of_folders_is_one_drive() {
+        let base = std::env::temp_dir().join(format!("resmon_ml_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let hf = base.join("huggingface").join("hub");
+        let pk = base.join("anaconda3").join("pkgs");
+        std::fs::create_dir_all(hf.join("models--bert")).unwrap();
+        std::fs::create_dir_all(&pk).unwrap();
+        std::fs::write(hf.join("models--bert").join("w.bin"), vec![0u8; 4000]).unwrap();
+        std::fs::write(pk.join("torch.tar"), vec![0u8; 900]).unwrap();
+        let name = format!("ML test {}", std::process::id());
+        let folders = vec![hf.to_string_lossy().to_string(), pk.to_string_lossy().to_string()];
+        let s = super::Scan::open_many(&name, &folders, || {});
+        wait(&s);
+        let g = s.tree.lock().unwrap();
+        assert_eq!(g.nodes[0].total, 4900);
+        let labels: Vec<String> = g.nodes[0].children.iter().map(|&c| g.label(c)).collect();
+        assert!(labels.contains(&"huggingface\\hub".to_string()) && labels.contains(&"anaconda3\\pkgs".to_string()), "{labels:?}");
+        let bert = g.nodes.iter().position(|n| &*n.name == "models--bert").unwrap() as u32;
+        assert_eq!(g.path(bert), hf.join("models--bert").to_string_lossy());
+        drop(g);
+        drop(s);
+        let _ = std::fs::remove_file(super::cache_path(&name));
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

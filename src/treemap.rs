@@ -119,7 +119,7 @@ pub fn whole_parts(sum: f64, whole: Option<(f64, f64, &'static str)>) -> Vec<(f6
 
 /// Pure layout of the treemap for W x H px. Group tiles come before their children (draw order).
 pub fn model(procs: &[Proc], field: Field, zoom: Option<&str>, w: f32, h: f32, sticky: &mut Sticky, whole: Option<(f64, f64, &'static str)>) -> Vec<Tile> {
-    let live: Vec<&Proc> = procs.iter().filter(|q| q.get(field) > 0.0 && zoom.is_none_or(|z| q.name == z)).collect();
+    let live: Vec<&Proc> = procs.iter().filter(|q| q.get(field) > 0.0 && zoom.is_none_or(|z| q.group == z)).collect();
     let parts = whole_parts(live.iter().map(|q| q.get(field)).sum(), whole);
     let mut vals: HashMap<Key, f64> = live.iter().map(|q| (Key::Pid(q.pid), q.get(field))).collect();
     vals.extend(parts.iter().map(|&(v, k)| (Key::Part(k), v)));
@@ -149,7 +149,7 @@ pub fn model(procs: &[Proc], field: Field, zoom: Option<&str>, w: f32, h: f32, s
     let leaf = |q: &Proc, r: [f64; 4], title: String, tiles: &mut Vec<Tile>| {
         if r[2] >= 7.0 && r[3] >= 7.0 {
             // specks are left to the group frame
-            tiles.push(Tile { key: Key::Pid(q.pid), hit: Some(Hit::Pid(q.pid)), rect: shrink(r, 1.0), title, value: q.get(field), name: q.name.clone(), cpu: q.cpu, header: false, free: false });
+            tiles.push(Tile { key: Key::Pid(q.pid), hit: Some(Hit::Pid(q.pid)), rect: shrink(r, 1.0), title, value: q.get(field), name: q.group.clone(), cpu: q.cpu, header: false, free: false });
         }
     };
     let order = |qs: &mut Vec<&Proc>| qs.sort_by(|a, b| sv(&Key::Pid(b.pid)).total_cmp(&sv(&Key::Pid(a.pid))).then(a.pid.cmp(&b.pid)));
@@ -169,7 +169,7 @@ pub fn model(procs: &[Proc], field: Field, zoom: Option<&str>, w: f32, h: f32, s
     }
     let mut groups: HashMap<&str, Vec<&Proc>> = HashMap::new();
     for q in &live {
-        groups.entry(q.name.as_str()).or_default().push(q);
+        groups.entry(q.group.as_str()).or_default().push(q);
     }
     let mut totals: Vec<(f64, &str)> = groups.iter().map(|(n, qs)| (qs.iter().map(|q| sv(&Key::Pid(q.pid))).sum(), *n)).collect();
     totals.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn p(pid: u32, name: &str, ws: f64) -> Proc {
-        Proc { pid, name: name.into(), ws, ..Default::default() }
+        Proc { pid, name: name.into(), group: name.into(), ws, ..Default::default() }
     }
 
     #[test]

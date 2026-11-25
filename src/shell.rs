@@ -82,6 +82,7 @@ struct Runner {
 enum Step {
     Move(f32, f32),
     Button(f32, f32, bool),
+    RButton(f32, f32, bool),
     Shot,
 }
 
@@ -110,6 +111,11 @@ fn parse_script(s: &str) -> Vec<(Instant, Step)> {
                 click(at + Duration::from_millis(120), &mut out);
             }
             "move" => out.push((at, Step::Move(x, y))),
+            "rclick" => {
+                out.push((at, Step::Move(x, y)));
+                out.push((at + Duration::from_millis(100), Step::RButton(x, y, true)));
+                out.push((at + Duration::from_millis(140), Step::RButton(x, y, false)));
+            }
             "shot" => out.push((at, Step::Shot)),
             _ => {}
         }
@@ -140,6 +146,10 @@ impl Runner {
                 Step::Button(x, y, pressed) => {
                     input.events.push(egui::Event::PointerMoved(pos(x, y)));
                     input.events.push(egui::Event::PointerButton { pos: pos(x, y), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+                }
+                Step::RButton(x, y, pressed) => {
+                    input.events.push(egui::Event::PointerMoved(pos(x, y)));
+                    input.events.push(egui::Event::PointerButton { pos: pos(x, y), button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() });
                 }
                 Step::Shot => shot = true,
             }

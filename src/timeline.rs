@@ -98,6 +98,7 @@ impl Timeline {
                 Proc {
                     pid: p.pid,
                     name: self.names[p.name as usize].clone(),
+                    group: self.names[p.name as usize].clone(),
                     cpu: v(Field::Cpu),
                     ws: v(Field::Ws),
                     private: v(Field::Private),
@@ -205,6 +206,22 @@ impl Alerts {
                     match top(Field::Gpu) {
                         Some(q) => (format!("GPU at {t}°C: {} uses {:.0}% of it", q.name, q.gpu), Some(q.pid)),
                         None => (format!("GPU at {t}°C"), None),
+                    }
+                }),
+            ),
+            (
+                // thermal or hardware slowdown while working: the training runs slower than it should (a
+                // power cap alone is normal at full load and is only shown on the card)
+                "gputhrottle",
+                g.util.is_some_and(|u| u >= 50.0) && g.throttle.iter().any(|w| *w != "power cap"),
+                30,
+                false,
+                Box::new(move || {
+                    let why: Vec<&str> = g.throttle.iter().copied().filter(|w| *w != "power cap").collect();
+                    let temp = g.temp.map(|t| format!(" at {t}°C")).unwrap_or_default();
+                    match top(Field::Gpu) {
+                        Some(q) => (format!("GPU slowed down ({}){temp}: {} is the one running on it", why.join(", "), q.name), Some(q.pid)),
+                        None => (format!("GPU slowed down ({}){temp}", why.join(", ")), None),
                     }
                 }),
             ),

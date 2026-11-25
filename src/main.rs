@@ -50,6 +50,7 @@ const I_VRAM: &str = "\u{E964}";
 const I_DISK: &str = "\u{EDA2}";
 const I_NET: &str = "\u{E774}";
 const I_DRIVES: &str = "\u{E8B7}";
+const I_ML: &str = "\u{E1D3}"; // books: models and caches
 const I_READ: &str = "\u{E7B3}"; // eye
 const I_WRITE: &str = "\u{E70F}"; // pencil
 const I_DOWN: &str = "\u{E896}";
@@ -439,6 +440,8 @@ struct App {
     tl: Arc<Mutex<timeline::Timeline>>, // the last 24 h, filled by the sampler thread
     alerts: Vec<timeline::Alert>,
     time_at: Option<usize>,          // Some: the map and the table show this sample of the timeline
+    menu_hit: Option<Hit>,           // what the map's right-click menu was opened on
+    suspended: HashSet<u32>,         // processes paused from a menu
     live_procs: Option<Arc<Vec<Proc>>>, // the live table, kept aside while looking at the past
 }
 
@@ -521,6 +524,8 @@ impl App {
             tl,
             alerts: Vec::new(),
             time_at: None,
+            menu_hit: None,
+            suspended: HashSet::new(),
             live_procs: None,
         }
     }
@@ -637,11 +642,12 @@ impl App {
     // -------------------------------------------------------------- processes / treemap model
 
     fn set_procs(&mut self, procs: Arc<Vec<Proc>>, now: f64) {
-        self.procs = procs;
+        // families: each process grouped under the one that launched its job
+        self.procs = if self.cfg.families { Arc::new(families(&procs)) } else { procs };
         self.by_pid = self.procs.iter().enumerate().map(|(i, q)| (q.pid, i)).collect();
         self.groups.clear();
         for (i, q) in self.procs.iter().enumerate() {
-            self.groups.entry(q.name.clone()).or_default().push(i);
+            self.groups.entry(q.group.clone()).or_default().push(i);
         }
         if self.zoom.as_ref().is_some_and(|z| !self.groups.contains_key(z)) {
             self.zoom = None;
@@ -706,7 +712,7 @@ impl App {
         let size = |n: &space::Node| if growth { delta(n).max(0.0) } else { n.total as f64 };
         let item = |c: u32, children: Vec<treemap::Item>| {
             let n = &g.nodes[c as usize];
-            treemap::Item { key: Key::Dir(c), hit: Some(Hit::Dir(c)), title: n.name.to_string(), value: size(n), free: false, delta: delta(n), children }
+            treemap::Item { key: Key::Dir(c), hit: Some(Hit::Dir(c)), title: g.label(c), value: size(n), free: false, delta: delta(n), children }
         };
         let kid = |c: u32| {
             let n = &g.nodes[c as usize];
@@ -741,7 +747,7 @@ impl App {
             self.park_space();
             let scan = self.scans.remove(drive).unwrap_or_else(|| {
                 let c = ctx.clone();
-                space::Scan::open(drive, move || c.request_repaint())
+                if drive == ML { space::Scan::open_many(ML, &ml_folders(), move || c.request_repaint()) } else { space::Scan::open(drive, move || c.request_repaint()) }
             });
             self.space = Some(SpaceView { scan, at: 0, used, total });
         } else if let Some(s) = &mut self.space {
@@ -1157,6 +1163,85 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
     }
 }
 
+/// The "ML storage" pseudo-drive.
+const ML: &str = "ML storage";
+
+/// Where ML work piles up on disk: model and package caches, experiment logs, and any folder at the top
+/// of a drive named like models / checkpoints / datasets / wandb. Only the ones that exist.
+fn ml_folders() -> Vec<String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let home = env("USERPROFILE").unwrap_or_default();
+    let local = env("LOCALAPPDATA").unwrap_or_default();
+    let mut c: Vec<String> = [
+        env("HF_HOME").unwrap_or(format!(r"{home}\.cache\huggingface")),
+        env("TORCH_HOME").unwrap_or(format!(r"{home}\.cache\torch")),
+        format!(r"{home}\.cache\wandb"),
+        format!(r"{home}\.cache\lm-studio"),
+        format!(r"{home}\.lmstudio\models"),
+        env("OLLAMA_MODELS").unwrap_or(format!(r"{home}\.ollama\models")),
+        format!(r"{home}\.keras"),
+        format!(r"{local}\pip\cache"),
+        format!(r"{home}\anaconda3\pkgs"),
+        format!(r"{home}\miniconda3\pkgs"),
+        format!(r"{home}\.conda\pkgs"),
+    ]
+    .into();
+    for (d, _, _) in sys::drives() {
+        if let Ok(rd) = std::fs::read_dir(format!(r"{d}\")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                if e.path().is_dir() && ["model", "checkpoint", "ckpt", "dataset", "wandb", "weights"].iter().any(|k| n.contains(k)) {
+                    c.push(e.path().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    c.retain(|p| std::path::Path::new(p).is_dir());
+    c.sort();
+    c.dedup();
+    c
+}
+
+/// Launchers that are not part of the jobs they start: a family stops below them.
+const NOT_A_FAMILY: [&str; 24] = [
+    "system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "svchost.exe", "lsass.exe", "explorer.exe", "sihost.exe",
+    "userinit.exe", "taskhostw.exe", "runtimebroker.exe", "dllhost.exe", "windowsterminal.exe", "openconsole.exe", "conhost.exe", "cmd.exe",
+    "powershell.exe", "pwsh.exe", "bash.exe", "wsl.exe", "code.exe", "resmon.exe",
+];
+
+/// Group every process under the root of its family: walk up the parents (each must be older than its
+/// child, so a reused PID does not adopt strangers) and stop below shells, terminals and system launchers.
+/// A training job (torchrun, its python workers, their DataLoader processes) becomes one group.
+fn families(procs: &[Proc]) -> Vec<Proc> {
+    let by_pid: HashMap<u32, usize> = procs.iter().enumerate().map(|(i, q)| (q.pid, i)).collect();
+    let stop = |i: usize| NOT_A_FAMILY.contains(&procs[i].name.to_lowercase().as_str());
+    let root: Vec<usize> = (0..procs.len())
+        .map(|i| {
+            let mut cur = i;
+            for _ in 0..32 {
+                let q = &procs[cur];
+                match by_pid.get(&q.ppid) {
+                    Some(&p) if p != cur && !stop(p) && (procs[p].create <= q.create || q.create == 0) => cur = p,
+                    _ => break,
+                }
+            }
+            cur
+        })
+        .collect();
+    let mut size: HashMap<usize, usize> = HashMap::new();
+    for &r in &root {
+        *size.entry(r).or_default() += 1;
+    }
+    procs
+        .iter()
+        .zip(&root)
+        .map(|(q, &r)| {
+            let group = if size[&r] > 1 { format!("{} family · {}", procs[r].name, procs[r].pid) } else { q.name.clone() };
+            Proc { group, ..q.clone() }
+        })
+        .collect()
+}
+
 /// Which processes ran on each logical CPU: [cpu] -> [(process index, % of that CPU)].
 ///
 /// Windows does not say where a thread ran (that needs a kernel trace, i.e. administrator). We know each
@@ -1233,6 +1318,31 @@ fn draw_drive_card(ui: &Ui, r: Rect, mount: &str, used: u64, total: u64, rd: f64
     let x = (t.right() + 10.0).max(inner.left() + w / 2.0);
     p.text(pos2(x, y), Align2::LEFT_CENTER, I_WRITE, icons(11.0), ac().disk2);
     text(&p, pos2(x + 16.0, y), Align2::LEFT_CENTER, &fmt_rate(wr), font(11.0), th().muted, inner.right() - x - 16.0);
+}
+
+/// ML storage: how much the model / package / experiment caches hold, the biggest ones and what grew.
+fn draw_ml_card(ui: &Ui, r: Rect, g: &space::Tree, selected: bool) {
+    let p = ui.painter().with_clip_rect(r);
+    card(&p, r, selected);
+    let inner = Rect::from_min_max(r.min + vec2(12.0, 10.0), r.max - vec2(12.0, 8.0));
+    let w = inner.width();
+    let ic = if selected { th().text } else { th().muted };
+    p.text(pos2(inner.left(), inner.top() + 6.0), Align2::LEFT_CENTER, I_ML, icons(12.0), ic);
+    text(&p, pos2(inner.left() + 18.0, inner.top()), Align2::LEFT_TOP, "ML STORAGE", bold(10.0), ic, w - 18.0);
+    let total = g.nodes[0].total;
+    let status = if g.running && g.scanned_at.is_none() { "scanning…" } else { "" };
+    text(&p, pos2(inner.left(), inner.top() + 16.0), Align2::LEFT_TOP, &format!("{}{}", fmt_bytes(total as f64), if status.is_empty() { String::new() } else { format!("  {status}") }), bold((w / 7.5).clamp(13.0, 20.0)), th().text, w);
+    let mut kids: Vec<u32> = g.nodes[0].children.clone();
+    kids.sort_by(|a, b| g.nodes[*b as usize].total.cmp(&g.nodes[*a as usize].total));
+    let mut y = inner.top() + 46.0;
+    for &c in kids.iter().take(3) {
+        let n = &g.nodes[c as usize];
+        let d = if g.has_prev { n.total as i64 - n.prev as i64 } else { 0 };
+        let size = if d.unsigned_abs() >= 50_000_000 { format!("{} {}{}", fmt_bytes(n.total as f64), if d > 0 { "+" } else { "\u{2212}" }, fmt_bytes(d.unsigned_abs() as f64)) } else { fmt_bytes(n.total as f64) };
+        let sr = text(&p, pos2(inner.right(), y), Align2::RIGHT_CENTER, &size, font(10.5), if d >= 50_000_000 { WARN } else { th().muted }, w * 0.55);
+        text(&p, pos2(inner.left(), y), Align2::LEFT_CENTER, &g.label(c), font(10.5), th().text, sr.left() - inner.left() - 6.0);
+        y += 15.0;
+    }
 }
 
 /// Space per volume. Returns each row's rect (the full view opens a drive's space map on click).
@@ -1367,6 +1477,141 @@ fn accent_card(ui: &mut Ui, a: &theme::Accents, selected: bool, i: usize) -> egu
     resp
 }
 
+// ------------------------------------------------------------------ right-click menus
+
+/// What a right-click menu item asks for; the app carries it out on the target it was opened on.
+#[derive(Clone, Copy)]
+enum Act {
+    CopyName,
+    CopyPid,
+    CopyCmd,
+    CopyPath,
+    OpenLocation,
+    Properties,
+    Search,
+    ShowOnly,
+    Priority(usize),
+    Suspend(bool),
+    End(bool),
+    DirEnter,
+    DirOpen,
+    DirTerminal,
+    DirRefresh,
+    CardHide,
+    CardTab(bool),
+}
+
+#[derive(Clone)]
+enum Target {
+    Proc(Hit),
+    Dir(u32),
+    Card(&'static str),
+}
+
+fn menu_item(ui: &mut Ui, icon: &str, label: &str, color: Color32) -> bool {
+    let r = ui.add(egui::Button::new(egui::RichText::new(format!("{icon}  {label}")).color(color)).frame(false).min_size(vec2(220.0, 24.0)));
+    if r.clicked() {
+        ui.close();
+        return true;
+    }
+    false
+}
+
+/// A process or an app: copy, locate, look up, priority, pause, end.
+fn proc_menu_ui(ui: &mut Ui, title: &str, single: bool, can_zoom: bool, suspended: bool) -> Option<Act> {
+    let mut a = None;
+    ui.label(egui::RichText::new(title).font(bold(12.5)).color(th().text));
+    ui.separator();
+    let t = th().text;
+    if menu_item(ui, "\u{E8C8}", "Copy name", t) {
+        a = Some(Act::CopyName);
+    }
+    if menu_item(ui, "\u{E8C8}", if single { "Copy PID" } else { "Copy PIDs" }, t) {
+        a = Some(Act::CopyPid);
+    }
+    if single && menu_item(ui, "\u{E8C8}", "Copy command line", t) {
+        a = Some(Act::CopyCmd);
+    }
+    if menu_item(ui, "\u{E8C8}", "Copy file path", t) {
+        a = Some(Act::CopyPath);
+    }
+    ui.separator();
+    if menu_item(ui, "\u{E838}", "Open file location", t) {
+        a = Some(Act::OpenLocation);
+    }
+    if menu_item(ui, "\u{E946}", "File properties", t) {
+        a = Some(Act::Properties);
+    }
+    if menu_item(ui, "\u{E721}", "Search the web for it", t) {
+        a = Some(Act::Search);
+    }
+    if can_zoom && menu_item(ui, "\u{E8A3}", "Show only this app", t) {
+        a = Some(Act::ShowOnly);
+    }
+    ui.separator();
+    ui.menu_button(egui::RichText::new("\u{E9E9}  Priority").color(t), |ui| {
+        for (i, (label, _)) in sys::PRIORITIES.iter().enumerate() {
+            if menu_item(ui, "", label, th().text) {
+                a = Some(Act::Priority(i));
+            }
+        }
+    });
+    if menu_item(ui, if suspended { "\u{E768}" } else { "\u{E769}" }, if suspended { "Resume" } else { "Suspend (pause it)" }, t) {
+        a = Some(Act::Suspend(!suspended));
+    }
+    ui.separator();
+    if menu_item(ui, "\u{E711}", "End task", DANGER) {
+        a = Some(Act::End(false));
+    }
+    if menu_item(ui, "\u{E711}", "End process tree", DANGER) {
+        a = Some(Act::End(true));
+    }
+    a
+}
+
+/// A folder of the disk map.
+fn dir_menu_ui(ui: &mut Ui, title: &str, has_kids: bool) -> Option<Act> {
+    let mut a = None;
+    ui.label(egui::RichText::new(title).font(bold(12.5)).color(th().text));
+    ui.separator();
+    let t = th().text;
+    if has_kids && menu_item(ui, "\u{E8A3}", "Open in the map", t) {
+        a = Some(Act::DirEnter);
+    }
+    if menu_item(ui, "\u{E838}", "Open in Explorer", t) {
+        a = Some(Act::DirOpen);
+    }
+    if menu_item(ui, "\u{E756}", "Terminal here", t) {
+        a = Some(Act::DirTerminal);
+    }
+    if menu_item(ui, "\u{E8C8}", "Copy path", t) {
+        a = Some(Act::CopyPath);
+    }
+    if menu_item(ui, "\u{E72C}", "Refresh this folder", t) {
+        a = Some(Act::DirRefresh);
+    }
+    if menu_item(ui, "\u{E946}", "Properties", t) {
+        a = Some(Act::Properties);
+    }
+    a
+}
+
+/// A card of the full view.
+fn card_menu_ui(ui: &mut Ui, title: &str, on_tab: Option<bool>) -> Option<Act> {
+    let mut a = None;
+    ui.label(egui::RichText::new(title).font(bold(12.5)).color(th().text));
+    ui.separator();
+    if let Some(on) = on_tab
+        && menu_item(ui, "\u{E7F4}", if on { "Remove from the docked tab" } else { "Show on the docked tab" }, th().text)
+    {
+        a = Some(Act::CardTab(!on));
+    }
+    if menu_item(ui, "\u{E7B3}", "Hide this card", th().text) {
+        a = Some(Act::CardHide);
+    }
+    a
+}
+
 /// Segmented pills; returns the index clicked.
 fn pills(ui: &mut Ui, items: &[(&str, bool)]) -> Option<usize> {
     let gs: Vec<_> = items.iter().map(|(l, on)| ui.painter().layout_no_wrap(l.to_string(), font(12.0), if *on { th().text } else { th().muted })).collect();
@@ -1435,7 +1680,10 @@ impl App {
         let g = &s.gpu;
         let (gv, gs) = match g.util {
             Some(u) => {
-                let extra: Vec<String> = [g.temp.map(|t| format!("{t}°C")), g.power.map(|w| format!("{w:.0} W"))].into_iter().flatten().collect();
+                // a held-down GPU says why first; otherwise temperature, power against its cap, fan
+                let held = (!g.throttle.is_empty() && u > 30.0).then(|| format!("slowed: {}", g.throttle.join(", ")));
+                let power = g.power.map(|w| match g.power_limit { Some(l) => format!("{w:.0}/{l:.0} W"), None => format!("{w:.0} W") });
+                let extra: Vec<String> = [held, g.temp.map(|t| format!("{t}°C")), power, g.fan.map(|f| format!("fan {f}%"))].into_iter().flatten().collect();
                 (format!("{u:.0}%"), if extra.is_empty() { g.name.clone() } else { extra.join(" · ") })
             }
             None => ("n/a".into(), s.gpu_err.clone().unwrap_or_else(|| "No NVIDIA GPU".into())),
@@ -1725,10 +1973,17 @@ impl App {
     }
 
     fn header(&mut self, ui: &Ui, r: Rect, now: f64) {
+        let mut card_act: Option<(Act, &'static str)> = None; // right click on a card
+        // ML storage: its walk starts the first time the card is shown and is kept like a drive's
+        if self.cfg.shows("ml") && !self.scans.contains_key(ML) && self.space.as_ref().is_none_or(|s| s.scan.root != ML) {
+            let c = ui.ctx().clone();
+            self.scans.insert(ML.into(), space::Scan::open_many(ML, &ml_folders(), move || c.request_repaint()));
+        }
         let gauges = self.gauges(false);
         // the measure cards, then one card per drive
         let drives: Vec<(String, u64, u64)> = if self.cfg.shows("drives") { self.tot.as_ref().map(|t| t.drives.clone()).unwrap_or_default() } else { Vec::new() };
-        let n = (gauges.len() + drives.len()).max(1) as f32;
+        let ml = self.cfg.shows("ml");
+        let n = (gauges.len() + drives.len() + ml as usize).max(1) as f32;
         let w = (r.width() - 10.0 * (n - 1.0)) / n;
         let mut pick = None;
         for (i, (key, g)) in gauges.iter().enumerate() {
@@ -1757,9 +2012,17 @@ impl App {
                     "ram" => "Size the treemap by memory (click again for private bytes)".to_string(),
                     "disk" => "Who reads and who writes the disk, side by side".to_string(),
                     "net" => "Who downloads and who uploads, side by side".to_string(),
+                    "gpu" => format!("Size the treemap by GPU load
+{}", self.gpu_details()),
                     _ => format!("Size the treemap by {}", g.title),
                 };
                 let resp = ui.interact(gr, Id::unique(("card", *key)), Sense::click()).on_hover_text(tip);
+                let on_tab = settings::TAB_BARS.iter().any(|t| t.0 == *key).then(|| self.cfg.tab.iter().any(|t| t == key));
+                let mut a = None;
+                resp.context_menu(|ui| a = card_menu_ui(ui, &g.title, on_tab));
+                if let Some(a) = a {
+                    card_act = Some((a, *key));
+                }
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 }
@@ -1781,6 +2044,11 @@ impl App {
             let (rd, wr) = io.iter().find(|d| &d.0 == mount).map_or((0.0, 0.0), |d| (d.1, d.2));
             draw_drive_card(ui, dr, mount, *used, *total, rd, wr, open.as_deref() == Some(mount.as_str()));
             let resp = ui.interact(dr, Id::unique(("drive", mount.as_str())), Sense::click()).on_hover_text(format!("{mount}: what fills it, folder by folder"));
+            let mut a = None;
+            resp.context_menu(|ui| a = card_menu_ui(ui, "Drives", None));
+            if let Some(a) = a {
+                card_act = Some((a, "drives"));
+            }
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
@@ -1788,11 +2056,36 @@ impl App {
                 drive = Some(mount.clone());
             }
         }
+        if ml {
+            let i = gauges.len() + drives.len();
+            let mr = Rect::from_min_size(pos2(r.left() + i as f32 * (w + 10.0), r.top()), vec2(w, r.height()));
+            let open = self.space.as_ref().is_some_and(|s| s.scan.root == ML);
+            let scan = if open { self.space.as_ref().map(|s| &s.scan) } else { self.scans.get(ML) };
+            if let Some(s) = scan {
+                draw_ml_card(ui, mr, &s.tree.lock().unwrap(), open);
+            }
+            let resp = ui.interact(mr, Id::unique("ml-card"), Sense::click()).on_hover_text("Model, package and experiment caches: what they hold and what grew");
+            let mut a = None;
+            resp.context_menu(|ui| a = card_menu_ui(ui, "ML storage", None));
+            if let Some(a) = a {
+                card_act = Some((a, "ml"));
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                drive = Some(ML.to_string());
+            }
+        }
         if let Some(m) = pick {
             self.metric = m;
             self.park_space();
             let _ = self.save_settings(); // the view comes back as it was left
             self.relayout(now);
+        }
+        if let Some((a, k)) = card_act {
+            let ctx = ui.ctx().clone();
+            self.apply_act(a, Target::Card(k), &ctx, now);
         }
         if let Some(d) = drive {
             self.open_space(&d, now, &ui.ctx().clone());
@@ -1836,6 +2129,17 @@ impl App {
         tu.with_layout(Layout::right_to_left(Align::Center), |tu| {
             tu.spacing_mut().item_spacing.x = 8.0;
             let cores_view = self.per_core && self.metric == Field::Cpu;
+            if !cores_view && let Some(i) = pills(tu, &[("By name", !self.cfg.families), ("Families", self.cfg.families)]) {
+                // families: a job and everything it launched as one group (torchrun, its workers, their loaders)
+                self.cfg.families = i == 1;
+                let _ = self.save_settings();
+                if let Some(p) = self.live_procs.clone().or_else(|| Some(self.procs.clone())) {
+                    let raw: Vec<Proc> = p.iter().map(|q| Proc { group: q.name.clone(), ..q.clone() }).collect();
+                    self.set_procs(Arc::new(raw), now);
+                }
+                self.zoom = None;
+                self.relayout(now);
+            }
             if !cores_view && pills(tu, &[("\u{23F2}  History", self.cfg.history)]).is_some() {
                 self.cfg.history = !self.cfg.history;
                 if !self.cfg.history && self.time_at.is_some() {
@@ -1877,10 +2181,11 @@ impl App {
                 chain.push(g.nodes[*chain.last().unwrap() as usize].parent);
             }
             chain.reverse();
-            let chain: Vec<(u32, String)> = chain.into_iter().map(|id| (id, g.nodes[id as usize].name.to_string())).collect();
+            let chain: Vec<(u32, String)> = chain.into_iter().map(|id| (id, g.label(id))).collect();
             let found = fmt_bytes(g.nodes[0].total as f64);
             let denied = if g.denied > 0 { format!(" · {} folders not readable", g.denied) } else { String::new() };
             let status = match (g.running, g.scanned_at) {
+                (true, None) if sv.used == 0 => format!("Scanning… {} folders, {found} found{denied}", g.checked),
                 (true, None) => format!("Scanning… {} folders, {found} of {} used{denied}", g.checked, fmt_bytes(sv.used as f64)),
                 (true, Some(_)) => format!("Updating… {} folders checked{denied}", g.checked),
                 (false, Some(at)) => {
@@ -1948,7 +2253,7 @@ impl App {
 
     /// "Per core": the CPU split into its physical cores, each with its threads (logical processors) side by
     /// side, filled by load. On a hybrid CPU each core says whether it is a performance or efficiency core.
-    fn draw_cores(&mut self, ui: &Ui, r: Rect) {
+    fn draw_cores(&mut self, ui: &Ui, r: Rect, now: f64) {
         let p = ui.painter().with_clip_rect(r);
         p.rect_filled(r, 10.0, th().tm_bg);
         let Some(t) = self.tot.clone() else { return };
@@ -2008,6 +2313,16 @@ impl App {
         }
         // hover: which process, how much of this CPU; click selects it
         let resp = ui.interact(r, Id::unique("cores"), Sense::click());
+        // right click on a segment: that process's menu
+        if resp.secondary_clicked() {
+            self.menu_hit = resp.hover_pos().and_then(|pos| segs.iter().find(|s| s.0.contains(pos))).map(|s| Hit::Pid(self.procs[s.1].pid));
+        }
+        if let Some(h @ Hit::Pid(_)) = self.menu_hit.clone()
+            && let Some(a) = self.proc_menu(&resp, &h)
+        {
+            let ctx = ui.ctx().clone();
+            self.apply_act(a, Target::Proc(h), &ctx, now);
+        }
         let Some(pos) = resp.hover_pos() else { return };
         let Some(&(sr, pi)) = segs.iter().find(|s| s.0.contains(pos)) else { return };
         let q = &self.procs[pi];
@@ -2035,7 +2350,7 @@ impl App {
 
     fn treemap(&mut self, ui: &mut Ui, r: Rect, now: f64) {
         if self.per_core && self.metric == Field::Cpu && self.space.is_none() {
-            self.draw_cores(ui, r);
+            self.draw_cores(ui, r, now);
             return;
         }
         let p = ui.painter().with_clip_rect(r);
@@ -2154,7 +2469,7 @@ impl App {
         if resp.double_clicked() && self.zoom.is_none() {
             let name = match &target {
                 Some(Hit::Group(n)) => Some(n.clone()),
-                Some(Hit::Pid(pid)) => self.by_pid.get(pid).map(|&i| self.procs[i].name.clone()),
+                Some(Hit::Pid(pid)) => self.by_pid.get(pid).map(|&i| self.procs[i].group.clone()),
                 _ => None,
             };
             if let Some(n) = name.filter(|n| self.groups.get(n).is_some_and(|g| g.len() > 1)) {
@@ -2165,6 +2480,19 @@ impl App {
                 self.relayout(now);
                 return;
             }
+        }
+        // right click: the menu of what is under the pointer (kept while the menu is open)
+        if resp.secondary_clicked() {
+            self.menu_hit = target.clone();
+        }
+        let picked = match self.menu_hit.clone() {
+            Some(Hit::Dir(id)) => self.dir_menu(&resp, id).map(|a| (a, Target::Dir(id))),
+            Some(h) => self.proc_menu(&resp, &h).map(|a| (a, Target::Proc(h))),
+            None => None,
+        };
+        if let Some((a, t)) = picked {
+            let ctx = ui.ctx().clone();
+            self.apply_act(a, t, &ctx, now);
         }
         self.hover = target.clone();
         if let (Some(h), Some(pos)) = (target, pos) {
@@ -2227,7 +2555,7 @@ impl App {
                 .map(|&c| {
                     let n = &g.nodes[c as usize];
                     let d = if g.has_prev { n.total as i64 - n.prev as i64 } else { 0 };
-                    (c, n.name.to_string(), n.total, n.files, n.children.len(), d)
+                    (c, g.label(c), n.total, n.files, n.children.len(), d)
                 })
                 .collect();
             if growth { v.sort_by(|a, b| b.5.cmp(&a.5)) } else { v.sort_by(|a, b| b.2.cmp(&a.2)) }
@@ -2250,9 +2578,15 @@ impl App {
             _ => None,
         };
         let (mut clicked, mut open) = (None, None);
+        let mut row_act: Option<(Act, u32)> = None; // right click on a row
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(&mut tu, 26.0, rows.len(), |ui, range| {
             for (id, name, total, files, kids, d) in &rows[range] {
                 let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
+                resp.context_menu(|ui| {
+                    if let Some(a) = dir_menu_ui(ui, name, *kids > 0) {
+                        row_act = Some((a, *id));
+                    }
+                });
                 if sel == Some(*id) {
                     ui.painter().rect_filled(rr, 6.0, th().row_sel);
                 } else if resp.hovered() {
@@ -2276,6 +2610,10 @@ impl App {
         });
         if let Some(id) = clicked {
             self.sel = Some(Hit::Dir(id));
+        }
+        if let Some((a, id)) = row_act {
+            let ctx = ui.ctx().clone();
+            self.apply_act(a, Target::Dir(id), &ctx, now);
         }
         if let Some(id) = open {
             self.space_enter(id, now);
@@ -2389,10 +2727,19 @@ impl App {
         let pdh = self.tot.as_ref().is_some_and(|t| t.pdh_ok);
         let k = self.cpu_scale();
         let mut clicked = None;
+        let mut row_act: Option<(Act, u32)> = None; // right click on a row
         egui::ScrollArea::vertical().auto_shrink(false).show_rows(&mut tu, 26.0, self.rows.len(), |ui, range| {
             for &i in &self.rows[range] {
                 let q = &self.procs[i];
                 let (rr, resp) = ui.allocate_exact_size(vec2(r.width(), 26.0), Sense::click());
+                let can_zoom = self.zoom.is_none() && self.groups.get(&q.group).is_some_and(|v| v.len() > 1);
+                let title = format!("{} · PID {}", q.name, q.pid);
+                let susp = self.suspended.contains(&q.pid);
+                resp.context_menu(|ui| {
+                    if let Some(a) = proc_menu_ui(ui, &title, true, can_zoom, susp) {
+                        row_act = Some((a, q.pid));
+                    }
+                });
                 if sel.contains(&q.pid) {
                     ui.painter().rect_filled(rr, 6.0, th().row_sel);
                 } else if resp.hovered() {
@@ -2402,7 +2749,7 @@ impl App {
                     clicked = Some(q.pid);
                 }
                 let vals = [
-                    q.name.clone(),
+                    if self.suspended.contains(&q.pid) { format!("\u{23F8} {}  (paused)", q.name) } else { q.name.clone() },
                     q.pid.to_string(),
                     format!("{:.1}", q.cpu * k),
                     fmt_bytes(q.ws),
@@ -2425,8 +2772,162 @@ impl App {
                 }
             }
         });
+        if let Some((a, pid)) = row_act {
+            let ctx = ui.ctx().clone();
+            self.apply_act(a, Target::Proc(Hit::Pid(pid)), &ctx, now);
+        }
         if let Some(pid) = clicked {
             self.sel = Some(Hit::Pid(pid));
+        }
+    }
+
+    /// The processes a menu acts on: one, or every process of an app / family.
+    fn target_pids(&self, h: &Hit) -> Vec<u32> {
+        match h {
+            Hit::Pid(p) => vec![*p],
+            Hit::Group(g) => self.groups.get(g).map(|v| v.iter().map(|&i| self.procs[i].pid).collect()).unwrap_or_default(),
+            Hit::Dir(_) => Vec::new(),
+        }
+    }
+
+    fn menu_title(&self, t: &Target) -> String {
+        match t {
+            Target::Proc(Hit::Pid(p)) => self.by_pid.get(p).map_or(format!("PID {p}"), |&i| format!("{}  \u{b7}  PID {p}", self.procs[i].name)),
+            Target::Proc(Hit::Group(g)) => format!("{g}  \u{b7}  {} processes", self.groups.get(g).map_or(0, |v| v.len())),
+            Target::Dir(id) | Target::Proc(Hit::Dir(id)) => self.space.as_ref().map(|s| s.scan.tree.lock().unwrap().label(*id)).unwrap_or_default(),
+            Target::Card(k) => settings::CARDS.iter().find(|c| c.0 == *k).map_or(k.to_string(), |c| c.1.to_string()),
+        }
+    }
+
+    /// The process menu for `h`, attached to `resp`; returns what was picked.
+    fn proc_menu(&self, resp: &egui::Response, h: &Hit) -> Option<Act> {
+        let title = self.menu_title(&Target::Proc(h.clone()));
+        let pids = self.target_pids(h);
+        let single = matches!(h, Hit::Pid(_));
+        let group = match h {
+            Hit::Pid(p) => self.by_pid.get(p).map(|&i| self.procs[i].group.clone()),
+            Hit::Group(g) => Some(g.clone()),
+            Hit::Dir(_) => None,
+        };
+        let can_zoom = self.zoom.is_none() && group.as_ref().is_some_and(|g| self.groups.get(g).is_some_and(|v| v.len() > 1));
+        let suspended = !pids.is_empty() && pids.iter().all(|p| self.suspended.contains(p));
+        let mut a = None;
+        resp.context_menu(|ui| a = proc_menu_ui(ui, &title, single, can_zoom, suspended));
+        a
+    }
+
+    fn dir_menu(&self, resp: &egui::Response, id: u32) -> Option<Act> {
+        let title = self.menu_title(&Target::Dir(id));
+        let kids = self.space.as_ref().is_some_and(|s| !s.scan.tree.lock().unwrap().nodes[id as usize].children.is_empty());
+        let mut a = None;
+        resp.context_menu(|ui| a = dir_menu_ui(ui, &title, kids));
+        a
+    }
+
+    /// Carry out a menu choice.
+    fn apply_act(&mut self, act: Act, target: Target, ctx: &egui::Context, now: f64) {
+        let path_of_dir = |s: &Self, id: u32| s.space.as_ref().map(|sv| sv.scan.tree.lock().unwrap().path(id)).unwrap_or_default();
+        match target {
+            Target::Proc(h) => {
+                let pids = self.target_pids(&h);
+                let Some(&first) = pids.first() else { return };
+                let q = self.by_pid.get(&first).map(|&i| self.procs[i].clone()).unwrap_or_default();
+                let exe = || sys::exe_path(first);
+                match act {
+                    Act::CopyName => ctx.copy_text(if let Hit::Group(g) = &h { g.clone() } else { q.name.clone() }),
+                    Act::CopyPid => ctx.copy_text(pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")),
+                    Act::CopyCmd => {
+                        if q.cmd.is_empty() {
+                            self.toast("Command line not accessible", true, now);
+                        } else {
+                            ctx.copy_text(q.cmd.clone());
+                        }
+                    }
+                    Act::CopyPath => match exe() {
+                        Some(p) => ctx.copy_text(p),
+                        None => self.toast("Cannot read where it runs from", true, now),
+                    },
+                    Act::OpenLocation => self.open_location(first, now),
+                    Act::Properties => {
+                        if !exe().is_some_and(|p| sys::shell("properties", &p)) {
+                            self.toast("Cannot open its properties", true, now);
+                        }
+                    }
+                    Act::Search => {
+                        let _ = sys::shell("open", &format!("https://www.google.com/search?q={}+windows+process", q.name.replace(' ', "+")));
+                    }
+                    Act::ShowOnly => {
+                        self.zoom = Some(q.group.clone());
+                        self.relayout(now);
+                    }
+                    Act::Priority(i) => {
+                        let (label, class) = sys::PRIORITIES[i];
+                        let ok = pids.iter().filter(|&&p| sys::set_priority(p, class)).count();
+                        self.toast(format!("Priority {label} on {ok} of {} process{}", pids.len(), if pids.len() == 1 { "" } else { "es" }), ok < pids.len(), now);
+                    }
+                    Act::Suspend(on) => {
+                        // pausing these freezes the desktop or Windows itself (and pausing ResMon, the way back)
+                        const VITAL: [&str; 10] =
+                            ["system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "dwm.exe", "explorer.exe", "resmon.exe"];
+                        if on && pids.iter().any(|p| self.by_pid.get(p).is_some_and(|&i| VITAL.contains(&self.procs[i].name.to_lowercase().as_str()))) {
+                            self.toast(format!("Pausing {} would freeze Windows: not done", q.name), true, now);
+                            return;
+                        }
+                        let ok = pids.iter().filter(|&&p| sys::suspend(p, on)).count();
+                        for p in &pids {
+                            if on { self.suspended.insert(*p) } else { self.suspended.remove(p) };
+                        }
+                        let what = if on { "Paused" } else { "Resumed" };
+                        self.toast(format!("{what} {ok} of {} process{}", pids.len(), if pids.len() == 1 { "" } else { "es" }), ok < pids.len(), now);
+                    }
+                    Act::End(tree) => {
+                        let what = if pids.len() == 1 { format!("{} (PID {first})", q.name) } else { format!("all {} processes of {}", pids.len(), q.group) };
+                        let me = pids.contains(&std::process::id());
+                        self.kill_ask = Some(KillAsk { pids, what, me, tree });
+                    }
+                    _ => {}
+                }
+            }
+            Target::Dir(id) => {
+                let path = path_of_dir(self, id);
+                match act {
+                    Act::DirEnter => self.space_enter(id, now),
+                    Act::DirOpen => {
+                        let _ = sys::shell("open", &path);
+                    }
+                    Act::DirTerminal => sys::terminal(&path),
+                    Act::CopyPath => ctx.copy_text(path),
+                    Act::Properties => {
+                        let _ = sys::shell("properties", &path);
+                    }
+                    Act::DirRefresh => {
+                        if let Some(s) = &self.space {
+                            let c = ctx.clone();
+                            s.scan.refresh_from(id, move || c.request_repaint());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Target::Card(key) => {
+                match act {
+                    Act::CardHide => {
+                        self.cfg.hidden.retain(|h| h != key);
+                        self.cfg.hidden.push(key.into());
+                    }
+                    Act::CardTab(on) => {
+                        self.cfg.tab.retain(|t| t != key);
+                        if on && self.cfg.tab.len() < 4 {
+                            self.cfg.tab.push(key.into());
+                        }
+                        if self.cfg.tab.is_empty() {
+                            self.cfg.tab.push("cpu".into());
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = self.save_settings();
+            }
         }
     }
 
@@ -2476,6 +2977,26 @@ impl App {
             self.set_procs(p, now);
         }
         self.relayout(now);
+    }
+
+    /// Everything NVML says about the GPU, for the card's tooltip.
+    fn gpu_details(&self) -> String {
+        let Some(g) = self.tot.as_ref().map(|t| &t.gpu) else { return String::new() };
+        let mut l = Vec::new();
+        if let Some((c, m)) = g.clock {
+            l.push(format!("Clock {c} of {m} MHz{}", g.mem_clock.map(|x| format!(" · memory {x} MHz")).unwrap_or_default()));
+        }
+        if let (Some(w), Some(cap)) = (g.power, g.power_limit) {
+            l.push(format!("Power {w:.0} W of a {cap:.0} W cap"));
+        }
+        if let Some(f) = g.fan {
+            l.push(format!("Fan {f}%"));
+        }
+        if let Some((pg, w, max)) = g.pcie {
+            l.push(format!("PCIe gen {pg} x{w}{}", if w < max { format!(" (the slot allows x{max})") } else { String::new() }));
+        }
+        l.push(if g.throttle.is_empty() { "Not held down".into() } else { format!("Held down by: {}", g.throttle.join(", ")) });
+        l.join("\n")
     }
 
     /// Which machine total and colour go with the current measure.
@@ -2655,6 +3176,7 @@ impl App {
             "vram" => I_VRAM,
             "net" => I_NET,
             "disk" => I_DISK,
+            "ml" => I_ML,
             _ => I_DRIVES,
         };
         egui::ScrollArea::vertical().auto_shrink(false).show(&mut su, |ui| {
@@ -2861,7 +3383,8 @@ fn setup_style(ctx: &egui::Context) {
     load("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]);
     load("sym", &["seguisym.ttf"]);
     let fam = |v: &[&str]| v.iter().map(|s| s.to_string()).filter(|s| fonts.font_data.contains_key(s)).collect::<Vec<_>>();
-    let (ui, semi, ic) = (fam(&["ui", "sym"]), fam(&["semi", "ui", "sym"]), fam(&["icons", "ui"]));
+    // the icon font last in every family: its glyphs sit in the private-use area, so icons work in any text
+    let (ui, semi, ic) = (fam(&["ui", "sym", "icons"]), fam(&["semi", "ui", "sym", "icons"]), fam(&["icons", "ui"]));
     fonts.families.insert(FontFamily::Proportional, ui.clone());
     fonts.families.insert(FontFamily::Monospace, ui);
     fonts.families.insert(FontFamily::Name("semi".into()), semi);
@@ -2891,6 +3414,37 @@ fn apply_visuals(ctx: &egui::Context) {
         s.spacing.button_padding = vec2(10.0, 5.0);
         s.interaction.tooltip_delay = 0.4;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(pid: u32, ppid: u32, name: &str, create: i64) -> Proc {
+        Proc { pid, ppid, name: name.into(), group: name.into(), create, ..Default::default() }
+    }
+
+    #[test]
+    fn a_job_and_its_children_are_one_family() {
+        let procs = [
+            p(10, 1, "explorer.exe", 100),
+            p(20, 10, "pwsh.exe", 200),
+            p(30, 20, "python.exe", 300), // torchrun, launched from a shell
+            p(31, 30, "python.exe", 301), // workers
+            p(32, 30, "python.exe", 302),
+            p(40, 31, "python.exe", 303), // a DataLoader process
+            p(50, 20, "python.exe", 400), // another job from the same shell: its own family
+            p(60, 30, "notepad.exe", 250), // older than its "parent": a reused PID, not a child
+        ];
+        let f = families(&procs);
+        let g = |pid: u32| f.iter().find(|q| q.pid == pid).unwrap().group.clone();
+        assert_eq!(g(30), "python.exe family · 30");
+        assert_eq!(g(31), g(30));
+        assert_eq!(g(40), g(30));
+        assert_eq!(g(50), "python.exe", "a single process keeps its name");
+        assert_eq!(g(60), "notepad.exe");
+        assert_eq!(g(20), "pwsh.exe", "a shell is not part of what it launches");
+    }
 }
 
 fn main() {

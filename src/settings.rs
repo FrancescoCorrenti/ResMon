@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 /// Cards of the full view / panel that can be switched off (DRIVES covers the per-drive cards).
-pub const CARDS: [(&str, &str); 7] =
-    [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("net", "Network"), ("disk", "Disk activity"), ("drives", "Drives")];
+pub const CARDS: [(&str, &str); 8] =
+    [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("net", "Network"), ("disk", "Disk activity"), ("drives", "Drives"), ("ml", "ML storage")];
 /// Measures the docked tab can show as bars.
 pub const TAB_BARS: [(&str, &str); 6] = [("cpu", "CPU"), ("ram", "Memory"), ("gpu", "GPU"), ("vram", "VRAM"), ("net", "Network"), ("disk", "Disk")];
 
@@ -23,6 +23,7 @@ pub struct Settings {
     pub hover: f32, // seconds resting on the tab before the panel opens
     pub alerts: bool,  // quiet alerts (dot on the tab, strip in the full view)
     pub history: bool, // the 24 h strip over the map
+    pub families: bool, // group processes by the job that launched them, not by name
 }
 
 impl Default for Settings {
@@ -41,6 +42,7 @@ impl Default for Settings {
             hover: 0.6,
             alerts: true,
             history: false,
+            families: false,
         }
     }
 }
@@ -82,6 +84,7 @@ impl Settings {
                 "hover" => s.hover = v.parse().unwrap_or(0.6_f32).clamp(0.2, 3.0),
                 "alerts" => s.alerts = b,
                 "history" => s.history = b,
+                "families" => s.families = b,
                 _ => {}
             }
         }
@@ -96,7 +99,7 @@ impl Settings {
         std::fs::create_dir_all(p.parent().unwrap())?;
         let anchor = self.anchor.map(|(x, y)| format!("{x},{y}")).unwrap_or_default();
         let text = format!(
-            "anchor={anchor}\nmetric={}\nheat={}\nrelative={}\nper_core={}\ntable_open={}\nhidden={}\ntab={}\ntheme={}\naccents={}\nhover={}\nalerts={}\nhistory={}\n",
+            "anchor={anchor}\nmetric={}\nheat={}\nrelative={}\nper_core={}\ntable_open={}\nhidden={}\ntab={}\ntheme={}\naccents={}\nhover={}\nalerts={}\nhistory={}\nfamilies={}\n",
             self.metric,
             self.heat,
             self.relative,
@@ -108,7 +111,8 @@ impl Settings {
             self.accents,
             self.hover,
             self.alerts,
-            self.history
+            self.history,
+            self.families
         );
         std::fs::write(p, text)
     }
