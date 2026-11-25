@@ -406,9 +406,9 @@ struct App {
 
 impl App {
     fn new(ctx: &egui::Context, hwnd: HWND) -> App {
-        setup_style(ctx);
         let cfg = settings::Settings::load();
         theme::set(&cfg.theme, &cfg.accents);
+        setup_style(ctx); // after the theme: egui's own widgets take its colours
         let anchor = cfg.anchor.unwrap_or_else(|| {
             let (_, t, r, b, _) = sys::monitor_at(0, 0); // (0, 0) is always on the primary monitor
             (r - 1, (t + b) / 2)
@@ -1229,6 +1229,86 @@ fn icon_button(ui: &mut Ui, glyph: &str, tip: &str, color: Color32) -> egui::Res
     resp.on_hover_text(tip)
 }
 
+/// A switch with its label (and a quieter hint under it). Returns true when flipped.
+fn toggle(ui: &mut Ui, on: &mut bool, label: &str, hint: &str) -> bool {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if hint.is_empty() { 30.0 } else { 40.0 }), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, *on, 0.15);
+    let p = ui.painter();
+    let dy = if hint.is_empty() { 0.0 } else { 8.0 };
+    text(p, pos2(r.left(), r.center().y - dy), Align2::LEFT_CENTER, label, font(13.0), th().text, r.width() - 60.0);
+    if !hint.is_empty() {
+        text(p, pos2(r.left(), r.center().y + 9.0), Align2::LEFT_CENTER, hint, font(11.0), th().faint, r.width() - 60.0);
+    }
+    let sw = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(38.0, 22.0));
+    p.rect_filled(sw, 11.0, mix(th().line, ac().cpu, t));
+    let kx = sw.left() + 11.0 + t * (sw.width() - 22.0);
+    p.circle_filled(pos2(kx, sw.center().y), 8.0, if th().light && t < 0.5 { Color32::WHITE } else { Color32::from_gray(250) });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        *on = !*on;
+        return true;
+    }
+    false
+}
+
+/// An on/off chip with an icon (cards, tab bars).
+fn chip(ui: &mut Ui, icon: &str, label: &str, on: bool, enabled: bool) -> egui::Response {
+    let g = ui.painter().layout_no_wrap(label.into(), font(12.5), if on { th().text } else { th().muted });
+    let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 44.0, 32.0), Sense::click());
+    let p = ui.painter();
+    let hover = resp.hovered() && enabled;
+    let fill = if on { mix(ac().cpu, th().card, 0.84) } else if hover { th().pill_on } else { th().card };
+    p.rect(r, 9.0, fill, Stroke::new(1.0, if on { alpha(ac().cpu, 0xB0) } else { th().line }), StrokeKind::Inside);
+    let ic = if on { ac().cpu } else if enabled { th().muted } else { th().faint };
+    p.text(pos2(r.left() + 16.0, r.center().y), Align2::CENTER_CENTER, icon, icons(13.0), ic);
+    p.galley(pos2(r.left() + 30.0, r.center().y - g.size().y / 2.0), g, th().text);
+    if hover {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// A small picture of a theme: its background, a card, three bars in the current colours.
+fn theme_card(ui: &mut Ui, t: &theme::Theme, selected: bool, i: usize) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(118.0, 96.0), Sense::click());
+    let _ = i;
+    let p = ui.painter();
+    let pic = Rect::from_min_size(r.min, vec2(r.width(), 70.0));
+    p.rect(pic, 10.0, t.bg, Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { ac().cpu } else { th().line }), StrokeKind::Inside);
+    let c = Rect::from_min_size(pic.min + vec2(10.0, 10.0), vec2(62.0, 50.0));
+    p.rect_filled(c, 6.0, t.card);
+    p.rect_filled(Rect::from_min_size(c.min + vec2(8.0, 9.0), vec2(30.0, 5.0)), 2.5, t.text);
+    p.rect_filled(Rect::from_min_size(c.min + vec2(8.0, 19.0), vec2(42.0, 4.0)), 2.0, t.muted);
+    for (k, col) in [ac().cpu, ac().ram, ac().gpu].into_iter().enumerate() {
+        let h = [26.0, 18.0, 32.0][k];
+        p.rect_filled(Rect::from_min_size(pos2(pic.right() - 34.0 + k as f32 * 9.0, pic.bottom() - 10.0 - h), vec2(5.0, h)), 2.5, col);
+    }
+    text(p, pos2(r.left() + 2.0, pic.bottom() + 13.0), Align2::LEFT_CENTER, t.name, if selected { bold(12.5) } else { font(12.5) }, if selected { th().text } else { th().muted }, r.width());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// A colour palette as a row of dots.
+fn accent_card(ui: &mut Ui, a: &theme::Accents, selected: bool, i: usize) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(118.0, 62.0), Sense::click());
+    let _ = i;
+    let p = ui.painter();
+    let pic = Rect::from_min_size(r.min, vec2(r.width(), 36.0));
+    p.rect(pic, 10.0, th().bg, Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { ac().cpu } else { th().line }), StrokeKind::Inside);
+    for (k, col) in [a.cpu, a.ram, a.gpu, a.vram, a.net, a.disk].into_iter().enumerate() {
+        p.circle_filled(pos2(pic.left() + 17.0 + k as f32 * 17.0, pic.center().y), 6.0, col);
+    }
+    text(p, pos2(r.left() + 2.0, pic.bottom() + 13.0), Align2::LEFT_CENTER, a.name, if selected { bold(12.5) } else { font(12.5) }, if selected { th().text } else { th().muted }, r.width());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp
+}
+
 /// Segmented pills; returns the index clicked.
 fn pills(ui: &mut Ui, items: &[(&str, bool)]) -> Option<usize> {
     let gs: Vec<_> = items.iter().map(|(l, on)| ui.painter().layout_no_wrap(l.to_string(), font(12.0), if *on { th().text } else { th().muted })).collect();
@@ -1521,7 +1601,7 @@ impl App {
             self.table(&mut ui, table, now);
         }
         if self.settings_open {
-            let sheet = Rect::from_min_max(pos2(inner.right() - 380.0, header.top()), inner.max);
+            let sheet = Rect::from_min_max(pos2(inner.right() - 440.0, header.top()), inner.max);
             self.settings_sheet(&mut ui, sheet, now);
         }
         self.kill_dialog(ui.ctx(), now);
@@ -1773,9 +1853,9 @@ impl App {
         let hybrid = cores.iter().any(|c| c.1 != cores[0].1);
         let top_class = cores.iter().map(|c| c.1).max().unwrap_or(0);
         let (w, h) = (r.width() - 8.0, r.height() - 8.0);
-        // the grid whose cells are closest to square
-        let cols = (1..=n).min_by_key(|&c| ((w / c as f32) / (h / n.div_ceil(c) as f32)).ln().abs().mul_add(1000.0, 0.0) as i64).unwrap_or(1);
-        let rows = n.div_ceil(cols);
+        // as many rows as fit cells of about 4:3 (threads sit side by side), cores shared evenly between them
+        let rows = (1..=n).min_by_key(|&rw| (((w / n.div_ceil(rw) as f32) / (h / rw as f32)) / 1.33).ln().abs().mul_add(1000.0, 0.0) as i64).unwrap_or(1);
+        let cols = n.div_ceil(rows);
         let (cw, ch) = (w / cols as f32, h / rows as f32);
         for (i, (threads, class)) in cores.iter().enumerate() {
             let cell = Rect::from_min_size(r.min + vec2(4.0 + (i % cols) as f32 * cw, 4.0 + (i / cols) as f32 * ch), vec2(cw, ch)).shrink(3.0);
@@ -2236,49 +2316,90 @@ impl App {
         }
     }
 
-    /// Settings: which cards, what the docked tab shows, theme and colours, timing, start-up.
+    /// Settings: look (theme, colours), what is shown (cards, tab bars), behaviour. Saved as they change.
     fn settings_sheet(&mut self, ui: &mut Ui, r: Rect, now: f64) {
         ui.interact(r, Id::unique("sheet-bg"), Sense::click()); // the map underneath gets no clicks
         let p = ui.painter().clone();
-        p.add(egui::epaint::Shadow { offset: [0, 8], blur: 24, spread: 0, color: alpha(Color32::BLACK, if th().light { 0x40 } else { 0xA0 }) }.as_shape(r, 14.0));
-        p.rect(r, 14.0, th().card, Stroke::new(1.0, th().sel_line), StrokeKind::Inside);
-        let mut su = ui.new_child(UiBuilder::new().max_rect(r.shrink(18.0)).layout(Layout::top_down(Align::Min)));
-        let mut changed = false;
-        let mut retheme = false;
-        su.horizontal(|ui| {
-            ui.label(egui::RichText::new("Settings").font(bold(16.0)).color(th().text));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, "\u{E8BB}", "Close settings", th().muted).clicked() {
-                    self.settings_open = false;
-                }
-            });
-        });
-        let section = |ui: &mut Ui, t: &str| {
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new(t).font(bold(10.0)).color(th().muted));
-            ui.add_space(4.0);
+        p.add(egui::epaint::Shadow { offset: [0, 10], blur: 32, spread: 0, color: alpha(Color32::BLACK, if th().light { 0x38 } else { 0xB0 }) }.as_shape(r, 16.0));
+        p.rect(r, 16.0, th().card, Stroke::new(1.0, th().line), StrokeKind::Inside);
+        // header
+        let hr = Rect::from_min_size(r.min, vec2(r.width(), 64.0));
+        let badge = Rect::from_center_size(pos2(hr.left() + 38.0, hr.center().y), vec2(36.0, 36.0));
+        p.rect_filled(badge, 10.0, mix(ac().cpu, th().card, 0.82));
+        p.text(badge.center(), Align2::CENTER_CENTER, "\u{E713}", icons(17.0), ac().cpu);
+        text(&p, pos2(badge.right() + 12.0, hr.center().y - 8.0), Align2::LEFT_CENTER, "Settings", bold(17.0), th().text, 200.0);
+        text(&p, pos2(badge.right() + 12.0, hr.center().y + 11.0), Align2::LEFT_CENTER, "Saved as you change them", font(11.0), th().faint, 220.0);
+        let close = Rect::from_center_size(pos2(hr.right() - 30.0, hr.center().y), vec2(32.0, 32.0));
+        let cr = ui.interact(close, Id::unique("sheet-close"), Sense::click());
+        if cr.hovered() {
+            p.rect_filled(close, 8.0, th().pill_on);
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        p.text(close.center(), Align2::CENTER_CENTER, "\u{E8BB}", icons(12.0), th().muted);
+        if cr.clicked() {
+            self.settings_open = false;
+        }
+        p.line_segment([pos2(r.left() + 1.0, hr.bottom()), pos2(r.right() - 1.0, hr.bottom())], Stroke::new(1.0, th().line));
+        let body = Rect::from_min_max(pos2(r.left() + 22.0, hr.bottom() + 6.0), r.max - vec2(22.0, 12.0));
+        let mut su = ui.new_child(UiBuilder::new().max_rect(body).layout(Layout::top_down(Align::Min)));
+        let (mut changed, mut retheme) = (false, false);
+        let section = |ui: &mut Ui, title: &str, hint: &str| {
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new(title).font(bold(13.0)).color(th().text));
+            if !hint.is_empty() {
+                ui.label(egui::RichText::new(hint).font(font(11.0)).color(th().faint));
+            }
+            ui.add_space(8.0);
+        };
+        let icon_of = |k: &str| match k {
+            "cpu" => I_CPU,
+            "ram" => I_RAM,
+            "gpu" => I_GPU,
+            "vram" => I_VRAM,
+            "net" => I_NET,
+            "disk" => I_DISK,
+            _ => I_DRIVES,
         };
         egui::ScrollArea::vertical().auto_shrink(false).show(&mut su, |ui| {
-            section(ui, "CARDS");
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            section(ui, "Theme", "");
+            ui.horizontal(|ui| {
+                for (i, t) in theme::THEMES.iter().enumerate() {
+                    if theme_card(ui, t, t.name == self.cfg.theme, i).clicked() {
+                        self.cfg.theme = t.name.into();
+                        (changed, retheme) = (true, true);
+                    }
+                }
+            });
+            section(ui, "Colours", "The colour of each measure: bars, curves, tiles");
+            ui.horizontal(|ui| {
+                for (i, a) in theme::ACCENTS.iter().enumerate() {
+                    if accent_card(ui, a, a.name == self.cfg.accents, i).clicked() {
+                        self.cfg.accents = a.name.into();
+                        (changed, retheme) = (true, true);
+                    }
+                }
+            });
+            section(ui, "Cards", "Which measures the full view and the panel show");
             ui.horizontal_wrapped(|ui| {
                 for (key, label) in settings::CARDS {
-                    let mut on = self.cfg.shows(key);
-                    if ui.checkbox(&mut on, label).changed() {
+                    let on = self.cfg.shows(key);
+                    if chip(ui, icon_of(key), label, on, true).clicked() {
                         self.cfg.hidden.retain(|h| h != key);
-                        if !on {
+                        if on {
                             self.cfg.hidden.push(key.into());
                         }
                         changed = true;
                     }
                 }
             });
-            section(ui, "DOCKED TAB  ·  bars, up to four");
+            section(ui, "Docked tab", "Up to four bars on the edge of the screen, in the order you pick them");
             ui.horizontal_wrapped(|ui| {
                 for (key, label) in settings::TAB_BARS {
-                    let mut on = self.cfg.tab.iter().any(|t| t == key);
+                    let on = self.cfg.tab.iter().any(|t| t == key);
                     let can = on || self.cfg.tab.len() < 4;
-                    if ui.add_enabled(can, egui::Checkbox::new(&mut on, label)).changed() {
-                        if on {
+                    if chip(ui, icon_of(key), label, on, can).clicked() && can {
+                        if !on {
                             self.cfg.tab.push(key.into());
                         } else if self.cfg.tab.len() > 1 {
                             self.cfg.tab.retain(|t| t != key);
@@ -2287,40 +2408,36 @@ impl App {
                     }
                 }
             });
-            section(ui, "THEME");
-            let names: Vec<&str> = theme::THEMES.iter().map(|t| t.name).collect();
-            let items: Vec<(&str, bool)> = names.iter().map(|n| (*n, *n == self.cfg.theme)).collect();
-            if let Some(i) = pills(ui, &items) {
-                self.cfg.theme = names[i].into();
-                (changed, retheme) = (true, true);
-            }
-            section(ui, "COLOURS");
-            let names: Vec<&str> = theme::ACCENTS.iter().map(|a| a.name).collect();
-            let items: Vec<(&str, bool)> = names.iter().map(|n| (*n, *n == self.cfg.accents)).collect();
-            if let Some(i) = pills(ui, &items) {
-                self.cfg.accents = names[i].into();
-                (changed, retheme) = (true, true);
-            }
-            section(ui, "BEHAVIOUR");
+            section(ui, "Behaviour", "");
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Panel opens after").color(th().text));
-                if ui.add(egui::Slider::new(&mut self.cfg.hover, 0.2..=2.0).suffix(" s").step_by(0.1)).changed() {
-                    changed = true;
-                }
+                ui.label(egui::RichText::new("Panel opens after resting").font(font(13.0)).color(th().text));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format!("{:.1} s", self.cfg.hover)).font(bold(13.0)).color(th().text));
+                    ui.spacing_mut().slider_width = 120.0;
+                    if ui.add(egui::Slider::new(&mut self.cfg.hover, 0.2..=2.0).step_by(0.1).show_value(false)).changed() {
+                        changed = true;
+                    }
+                });
             });
-            if ui.checkbox(&mut self.table_open, "Show the process list under the map").changed() {
+            if toggle(ui, &mut self.table_open, "Process list", "Under the map; the arrow in the toolbar folds it too") {
                 changed = true;
             }
             let mut st = self.startup;
-            if ui.checkbox(&mut st, "Start with Windows").changed() {
+            if toggle(ui, &mut st, "Start with Windows", "As administrator, through the ResMon task when installed") {
                 self.toggle_startup(now);
             }
-            ui.add_space(16.0);
-            if ui.button("Quit ResMon").clicked() {
+            ui.add_space(18.0);
+            let (qr, qresp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
+            ui.painter().rect(qr, 10.0, if qresp.hovered() { alpha(DANGER, 0x22) } else { Color32::TRANSPARENT }, Stroke::new(1.0, alpha(DANGER, 0x90)), StrokeKind::Inside);
+            ui.painter().text(qr.center(), Align2::CENTER_CENTER, "Quit ResMon", bold(13.0), DANGER);
+            if qresp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if qresp.clicked() {
                 self.quit = true;
             }
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Saved as you change them, in %APPDATA%\\ResMon\\settings.txt").font(font(11.0)).color(th().faint));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("%APPDATA%\\ResMon\\settings.txt").font(font(10.5)).color(th().faint));
         });
         if retheme {
             theme::set(&self.cfg.theme, &self.cfg.accents);
