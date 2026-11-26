@@ -85,7 +85,7 @@ def card(im, caption, size, scale):
 
 
 cores = Image.open(src / "cores.png").convert("RGBA")
-card(cores, "Per core: every core, its two threads, and what ran there", (1800, 1000), 0.82).save(out / "cores.png", optimize=True)
+card(cores, "Per core: every core, its threads, and what ran there", (1800, 1000), 0.82).save(out / "cores.png", optimize=True)
 menu = Image.open(src / "menu.png").convert("RGBA").crop((880, 250, 1800, 1060))
 card(menu, "Right-click anything", (1100, 960), 1.0).save(out / "menu.png", optimize=True)
 card(panel, "The hover panel", (520, 1180), 1.0).save(out / "panel.png", optimize=True)

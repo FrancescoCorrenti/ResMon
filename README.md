@@ -35,7 +35,7 @@ under 1% of one CPU core.
 <td width="50%"><img src="docs/menu.png" alt="Right-click menu on a process"></td>
 </tr>
 <tr>
-<td><b>Per core.</b> Every physical core with its two threads, each filled by its load and split into the processes that ran there.</td>
+<td><b>Per core.</b> Every physical core with its threads (however many it has: one, two, P- and E-cores mixed), each filled by its load and split into the processes that ran there.</td>
 <td><b>Right-click anything.</b> Copy name, PID, command line or path, open its folder, search the web for it, change priority, pause it, end it or its whole tree.</td>
 </tr>
 </table>

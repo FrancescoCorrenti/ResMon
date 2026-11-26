@@ -2364,8 +2364,14 @@ impl App {
                     segs.push((sr, pi));
                     y -= sh;
                 }
-                text(&p, tr.min + vec2(6.0, 4.0), Align2::LEFT_TOP, &format!("Thread {}", j + 1), font(10.0), th().muted, tw - 10.0);
-                text(&p, tr.min + vec2(6.0, 17.0), Align2::LEFT_TOP, &format!("CPU {k}  ·  {v:.0}%"), font(10.0), th().text, tw - 10.0);
+                // a core without SMT (or an E-core) has one thread: no "Thread 1" label then
+                let y0 = if threads.len() > 1 {
+                    text(&p, tr.min + vec2(6.0, 4.0), Align2::LEFT_TOP, &format!("Thread {}", j + 1), font(10.0), th().muted, tw - 10.0);
+                    17.0
+                } else {
+                    4.0
+                };
+                text(&p, tr.min + vec2(6.0, y0), Align2::LEFT_TOP, &format!("CPU {k}  ·  {v:.0}%"), font(10.0), th().text, tw - 10.0);
             }
         }
         // hover: which process, how much of this CPU; click selects it
