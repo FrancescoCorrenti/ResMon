@@ -186,12 +186,15 @@ impl Runner {
         if self.dib.as_ref().is_none_or(|d| d.w != w || d.h != h) {
             self.dib = Some(Dib::new(w, h));
         }
+        // textures first: egui sends each delta (the font atlas included) only once, a skipped frame must not lose it
+        self.raster.set_textures(&out.textures_delta);
         let dib = self.dib.as_ref().unwrap();
         if dib.bits.is_null() {
+            self.raster.free_textures(&out.textures_delta);
+            self.dib = None; // try again next frame
             return;
         }
         let pixels = unsafe { std::slice::from_raw_parts_mut(dib.bits, w * h) };
-        self.raster.set_textures(&out.textures_delta);
         let prims = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         let t_tess = Instant::now();
         let damage = self.raster.render(&prims, pixels, w, h, out.pixels_per_point);

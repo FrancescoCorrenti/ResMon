@@ -379,8 +379,20 @@ struct Trans {
     from: Vec2, // size (points) of the face we come from
 }
 
+/// Ending these takes Windows down (a bugcheck or a dead session); pausing them, or explorer and ResMon itself,
+/// freezes the desktop with no way back.
+const NO_END: [&str; 13] = [
+    "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+    "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe", "dwm.exe",
+];
+const NO_PAUSE: [&str; 19] = [
+    "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+    "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe", "dwm.exe", "explorer.exe", "fontdrvhost.exe", "sihost.exe",
+    "ctfmon.exe", "audiodg.exe", "resmon.exe",
+];
+
 struct KillAsk {
-    pids: Vec<u32>,
+    pids: Vec<(u32, i64)>, // pid and creation time
     what: String,
     me: bool,
     tree: bool,
@@ -645,6 +657,11 @@ impl App {
         // families: each process grouped under the one that launched its job
         self.procs = if self.cfg.families { Arc::new(families(&procs)) } else { procs };
         self.by_pid = self.procs.iter().enumerate().map(|(i, q)| (q.pid, i)).collect();
+        if self.time_at.is_none() {
+            let by_pid = &self.by_pid;
+            self.suspended.retain(|p| by_pid.contains_key(p)); // gone processes, or their pid shows "paused" on a new one
+            self.users.retain(|p, _| by_pid.contains_key(p));
+        }
         self.groups.clear();
         for (i, q) in self.procs.iter().enumerate() {
             self.groups.entry(q.group.clone()).or_default().push(i);
@@ -1031,24 +1048,64 @@ impl App {
 
     // -------------------------------------------------------------- actions
 
-    fn kill(&mut self, pids: &[u32], tree: bool, now: f64) {
-        let mut targets: Vec<u32> = pids.to_vec();
+    /// The processes an action may touch, each with its creation time (so a reused pid is not hit), or None
+    /// with a toast saying why not: a past sample of the history, a process gone, or one Windows cannot lose.
+    fn act_on(&mut self, pids: &[u32], verb: &str, guard: &[&str], now: f64) -> Option<Vec<(u32, i64)>> {
+        if self.time_at.is_some() {
+            self.toast("These are processes from the past: go back to now first", true, now);
+            return None;
+        }
+        let mut out = Vec::new();
+        for &p in pids {
+            let Some(&i) = self.by_pid.get(&p) else {
+                self.toast(format!("PID {p} is gone"), true, now);
+                return None;
+            };
+            let q = &self.procs[i];
+            if guard.contains(&q.name.to_lowercase().as_str()) {
+                let name = q.name.clone();
+                self.toast(format!("{verb} {name} would bring Windows down: not done"), true, now);
+                return None;
+            }
+            out.push((p, q.create));
+        }
+        Some(out)
+    }
+
+    fn ask_end(&mut self, pids: &[u32], what: String, tree: bool, now: f64) {
+        if let Some(pids) = self.act_on(pids, "Ending", &NO_END, now) {
+            let me = pids.iter().any(|p| p.0 == std::process::id());
+            self.kill_ask = Some(KillAsk { pids, what, me, tree });
+        }
+    }
+
+    fn priority(&mut self, pids: &[u32], i: usize, now: f64) {
+        let Some(live) = self.act_on(pids, "", &[], now) else { return };
+        let (label, class) = sys::PRIORITIES[i];
+        let ok = live.iter().filter(|p| sys::set_priority(p.0, p.1, class)).count();
+        self.toast(format!("Priority {label} on {ok} of {} process{}", live.len(), if live.len() == 1 { "" } else { "es" }), ok < live.len(), now);
+    }
+
+    fn kill(&mut self, pids: &[(u32, i64)], tree: bool, now: f64) {
+        let mut targets: Vec<(u32, i64)> = pids.to_vec();
         if tree {
             // descendants by parent pid; a child is never older than its parent (guards against pid reuse)
             let mut i = 0;
             while i < targets.len() {
-                let (pid, born) = (targets[i], self.by_pid.get(&targets[i]).map_or(0, |&k| self.procs[k].create));
+                let (pid, born) = targets[i];
                 for q in self.procs.iter() {
-                    if q.ppid == pid && q.create >= born && q.pid != pid && !targets.contains(&q.pid) {
-                        targets.push(q.pid);
+                    if q.ppid == pid && q.create >= born && q.pid != pid && !targets.iter().any(|t| t.0 == q.pid)
+                        && !NO_END.contains(&q.name.to_lowercase().as_str())
+                    {
+                        targets.push((q.pid, q.create));
                     }
                 }
                 i += 1;
             }
         }
         let (mut killed, mut denied) = (0, 0);
-        for pid in targets {
-            match sys::kill(pid) {
+        for (pid, born) in targets {
+            match sys::kill(pid, born) {
                 Ok(true) => killed += 1,
                 Ok(false) => {}
                 Err(()) => denied += 1,
@@ -2645,19 +2702,12 @@ impl App {
         let mut au = ui.new_child(UiBuilder::new().max_rect(r.shrink2(vec2(6.0, 0.0))).layout(Layout::right_to_left(Align::Center)));
         if link(&mut au, "End task", DANGER, 12.0).clicked() {
             let what = if pids.len() == 1 { format!("{name} (PID {pid})") } else { format!("all {} {name} processes", pids.len()) };
-            let me = pids.contains(&std::process::id());
-            self.kill_ask = Some(KillAsk { pids: pids.clone(), what, me, tree: false });
+            self.ask_end(&pids, what, false, now);
         }
         au.menu_button(egui::RichText::new("Priority").font(font(12.0)).color(th().muted), |ui| {
-            for (label, class) in sys::PRIORITIES {
-                if ui.button(label).clicked() {
-                    let ok = pids.iter().filter(|&&p| sys::set_priority(p, class)).count();
-                    let denied = pids.len() - ok;
-                    if denied > 0 {
-                        self.toast(format!("Priority set on {ok}, access denied on {denied} (run as administrator)"), true, now);
-                    } else {
-                        self.toast(format!("Priority set to {label} on {ok} process{}", if ok != 1 { "es" } else { "" }), false, now);
-                    }
+            for (i, (label, _)) in sys::PRIORITIES.iter().enumerate() {
+                if ui.button(*label).clicked() {
+                    self.priority(&pids, i, now);
                     ui.close();
                 }
             }
@@ -2860,30 +2910,25 @@ impl App {
                         self.zoom = Some(q.group.clone());
                         self.relayout(now);
                     }
-                    Act::Priority(i) => {
-                        let (label, class) = sys::PRIORITIES[i];
-                        let ok = pids.iter().filter(|&&p| sys::set_priority(p, class)).count();
-                        self.toast(format!("Priority {label} on {ok} of {} process{}", pids.len(), if pids.len() == 1 { "" } else { "es" }), ok < pids.len(), now);
-                    }
+                    Act::Priority(i) => self.priority(&pids, i, now),
                     Act::Suspend(on) => {
-                        // pausing these freezes the desktop or Windows itself (and pausing ResMon, the way back)
-                        const VITAL: [&str; 10] =
-                            ["system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "dwm.exe", "explorer.exe", "resmon.exe"];
-                        if on && pids.iter().any(|p| self.by_pid.get(p).is_some_and(|&i| VITAL.contains(&self.procs[i].name.to_lowercase().as_str()))) {
-                            self.toast(format!("Pausing {} would freeze Windows: not done", q.name), true, now);
-                            return;
-                        }
-                        let ok = pids.iter().filter(|&&p| sys::suspend(p, on)).count();
-                        for p in &pids {
-                            if on { self.suspended.insert(*p) } else { self.suspended.remove(p) };
+                        let guard: &[&str] = if on { &NO_PAUSE } else { &[] };
+                        let Some(live) = self.act_on(&pids, "Pausing", guard, now) else { return };
+                        // NtSuspendProcess nests: touch only the ones whose state changes, so one Resume undoes one Pause
+                        let todo: Vec<_> = live.into_iter().filter(|p| self.suspended.contains(&p.0) != on).collect();
+                        let mut ok = 0;
+                        for (p, born) in &todo {
+                            if sys::suspend(*p, *born, on) {
+                                ok += 1;
+                                if on { self.suspended.insert(*p) } else { self.suspended.remove(p) };
+                            }
                         }
                         let what = if on { "Paused" } else { "Resumed" };
-                        self.toast(format!("{what} {ok} of {} process{}", pids.len(), if pids.len() == 1 { "" } else { "es" }), ok < pids.len(), now);
+                        self.toast(format!("{what} {ok} of {} process{}", todo.len(), if todo.len() == 1 { "" } else { "es" }), ok < todo.len(), now);
                     }
                     Act::End(tree) => {
                         let what = if pids.len() == 1 { format!("{} (PID {first})", q.name) } else { format!("all {} processes of {}", pids.len(), q.group) };
-                        let me = pids.contains(&std::process::id());
-                        self.kill_ask = Some(KillAsk { pids, what, me, tree });
+                        self.ask_end(&pids, what, tree, now);
                     }
                     _ => {}
                 }
@@ -2946,11 +2991,10 @@ impl App {
         if let Some(pid) = a.pid {
             let name = self.by_pid.get(&pid).map(|&i| self.procs[i].name.clone()).unwrap_or_else(|| format!("PID {pid}"));
             if link(&mut au, "End task", DANGER, 12.0).clicked() {
-                self.kill_ask = Some(KillAsk { pids: vec![pid], what: format!("{name} (PID {pid})"), me: pid == std::process::id(), tree: false });
+                self.ask_end(&[pid], format!("{name} (PID {pid})"), false, now);
             }
             if link(&mut au, "Lower priority", th().muted, 12.0).clicked() {
-                let ok = sys::set_priority(pid, sys::PRIORITIES[1].1);
-                self.toast(if ok { format!("{name} set to below normal priority") } else { format!("Cannot change the priority of {name}") }, !ok, now);
+                self.priority(&[pid], 1, now);
             }
             if link(&mut au, "Show", th().muted, 12.0).clicked() {
                 self.sel = Some(Hit::Pid(pid));
@@ -3448,6 +3492,17 @@ mod tests {
 }
 
 fn main() {
+    // one ResMon at a time: a second one (Run key plus a manual start) would stop the first one's network trace.
+    // The screenshot and check runs (RESMON_SCRIPT) are allowed next to the real one.
+    if std::env::var_os("RESMON_SCRIPT").is_none() && !sys::first_instance() {
+        return;
+    }
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        net::stop(); // a crash must not leave the kernel trace session running
+        default_hook(info);
+    }));
+    sys::quiet_drive_errors();
     shell::run();
     net::stop(); // a real-time trace session would outlive us
 }

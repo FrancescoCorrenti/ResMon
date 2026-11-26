@@ -29,6 +29,13 @@ const RECV: [u16; 5] = [1004, 1006, 1009, 1012, 1015]; // recv, recvfrom, recvfr
 /// pid -> cumulative (sent, received) bytes since the session started.
 static TOTALS: Mutex<Option<HashMap<u32, (u64, u64)>>> = Mutex::new(None);
 
+/// Forget processes that exited (one entry per pid that ever used the network otherwise).
+pub fn retain(alive: impl Fn(u32) -> bool) {
+    if let Some(m) = TOTALS.lock().unwrap().as_mut() {
+        m.retain(|pid, _| alive(*pid));
+    }
+}
+
 unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
     let r = unsafe { &*rec };
     if r.EventHeader.ProviderId != AFD || r.UserDataLength < 44 {

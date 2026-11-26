@@ -316,7 +316,7 @@ fn save(root: &str, g: &Tree) -> std::io::Result<()> {
         i += 1;
     }
     let new_id: HashMap<u32, u32> = order.iter().enumerate().map(|(k, &id)| (id, k as u32)).collect();
-    let tmp = p.with_extension("tmp");
+    let tmp = p.with_extension(format!("{}.tmp", std::process::id())); // two instances must not share one tmp file
     let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
     w.write_all(b"RMS2")?;
     w.write_all(&g.scanned_at.unwrap_or(0).to_le_bytes())?;
@@ -358,10 +358,14 @@ fn load(root: &str) -> Option<Tree> {
         r.read_exact(&mut b1).ok()?;
     }
     let has_prev = b1[0] == 1;
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut nodes = Vec::with_capacity(count.min(1 << 20)); // a damaged count must not reserve gigabytes
+    for id in 0..count {
         r.read_exact(&mut b4).ok()?;
         let parent = u32::from_le_bytes(b4);
+        // written parents first: anything else is a damaged file (a self-loop would hang path(), a big one panic)
+        if id > 0 && parent as usize >= id {
+            return None;
+        }
         r.read_exact(&mut b8).ok()?;
         let files = u64::from_le_bytes(b8);
         let prev = if v2 {

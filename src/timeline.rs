@@ -241,7 +241,8 @@ impl Alerts {
                 0,
                 full.is_some_and(|d| (d.2 - d.1) as f64 / (d.2 as f64) < 0.02),
                 Box::new(move || {
-                    let d = full.unwrap();
+                    // the alert outlives its condition by 10 s: the drive may be gone or freed by now
+                    let Some(d) = full else { return ("A drive was almost full: space is back".into(), None) };
                     (format!("Drive {} almost full: {:.1} GB free", d.0, gb((d.2 - d.1) as f64)), None)
                 }),
             ),

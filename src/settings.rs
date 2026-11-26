@@ -81,7 +81,7 @@ impl Settings {
                 "tab" => s.tab = list(v),
                 "theme" => s.theme = v.into(),
                 "accents" => s.accents = v.into(),
-                "hover" => s.hover = v.parse().unwrap_or(0.6_f32).clamp(0.2, 3.0),
+                "hover" => s.hover = v.parse().ok().filter(|h: &f32| h.is_finite()).unwrap_or(0.6).clamp(0.2, 3.0),
                 "alerts" => s.alerts = b,
                 "history" => s.history = b,
                 "families" => s.families = b,
@@ -114,7 +114,10 @@ impl Settings {
             self.history,
             self.families
         );
-        std::fs::write(p, text)
+        // tmp + rename: a crash mid-write must not leave an empty file (every setting lost)
+        let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(tmp, p)
     }
 
     pub fn shows(&self, card: &str) -> bool {

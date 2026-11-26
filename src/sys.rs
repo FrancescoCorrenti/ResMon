@@ -274,7 +274,39 @@ pub fn exe_path(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
+/// RESMON_DEMO: for screenshots that must not show the owner's machine. Real measurements, but every
+/// process that is not a stock Windows one is renamed to a common app, command lines and users are made up.
+pub fn demo() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("RESMON_DEMO").is_some())
+}
+
+const DEMO_KEEP: [&str; 40] = [
+    "System", "Registry", "Idle", "System Idle Process", "Memory Compression", "Secure System", "svchost.exe", "explorer.exe",
+    "dwm.exe", "csrss.exe", "lsass.exe", "services.exe", "wininit.exe", "winlogon.exe", "smss.exe", "fontdrvhost.exe",
+    "sihost.exe", "taskhostw.exe", "ctfmon.exe", "StartMenuExperienceHost.exe", "TextInputHost.exe", "ShellExperienceHost.exe",
+    "SearchHost.exe", "RuntimeBroker.exe", "conhost.exe", "audiodg.exe", "spoolsv.exe", "WmiPrvSE.exe", "dllhost.exe",
+    "MsMpEng.exe", "SecurityHealthService.exe", "NVDisplay.Container.exe", "nvcontainer.exe", "msedge.exe",
+    "msedgewebview2.exe", "vmmem", "vmmemWSL", "WindowsTerminal.exe", "OpenConsole.exe", "ResMon.exe",
+];
+const DEMO_APPS: [&str; 16] = [
+    "chrome.exe", "Code.exe", "Spotify.exe", "Slack.exe", "steam.exe", "blender.exe", "python.exe", "Figma.exe",
+    "Teams.exe", "Notion.exe", "obs64.exe", "node.exe", "firefox.exe", "Photoshop.exe", "Docker Desktop.exe", "zoom.exe",
+];
+
+fn demo_mask(p: &mut Proc) {
+    if !DEMO_KEEP.iter().any(|k| k.eq_ignore_ascii_case(&p.name)) {
+        let h = p.name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b.to_ascii_lowercase() as u32);
+        p.name = DEMO_APPS[h as usize % DEMO_APPS.len()].to_string();
+        p.group = p.name.clone();
+    }
+    p.cmd = format!("\"C:\\Program Files\\{}\" --type=renderer", p.name);
+}
+
 pub fn username(pid: u32) -> String {
+    if demo() {
+        return "DESKTOP\\you".into();
+    }
     let get = || -> Option<String> {
         let h = Handle(open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?);
         let mut tok = HANDLE::default();
@@ -296,17 +328,45 @@ pub fn username(pid: u32) -> String {
     get().unwrap_or_else(|| "(access denied)".into())
 }
 
-/// Ok(true) killed, Ok(false) gone already, Err(()) access denied.
-pub fn kill(pid: u32) -> Result<bool, ()> {
-    let Some(h) = open(pid, PROCESS_TERMINATE) else {
-        return if open(pid, PROCESS_QUERY_LIMITED_INFORMATION).map(|h| Handle(h)).is_some() { Err(()) } else { Ok(false) };
+/// False if another ResMon already runs in this session (a named mutex it holds until it exits).
+pub fn first_instance() -> bool {
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    match unsafe { CreateMutexW(None, true, &HSTRING::from("Local\\ResMon-single-instance")) } {
+        Ok(_) => (unsafe { GetLastError() }) != ERROR_ALREADY_EXISTS, // the handle stays open for the process lifetime
+        Err(_) => true,
+    }
+}
+
+/// No "There is no disk in the drive" system box when a card reader slot is polled for free space.
+pub fn quiet_drive_errors() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+}
+
+/// The process `pid` only if it is still the one born at `born` (its creation time, 100 ns since 1601):
+/// between a click and the action the pid may have been reused by another process.
+fn open_same(pid: u32, born: i64, access: PROCESS_ACCESS_RIGHTS) -> Option<Handle> {
+    let h = Handle(open(pid, access | PROCESS_QUERY_LIMITED_INFORMATION)?);
+    let (mut c, mut e, mut k, mut u) = Default::default();
+    unsafe { GetProcessTimes(h.0, &mut c, &mut e, &mut k, &mut u).ok()? };
+    let created = ((c.dwHighDateTime as i64) << 32) | c.dwLowDateTime as i64;
+    (created == born).then_some(h)
+}
+
+/// Ok(true) killed, Ok(false) gone already (or the pid now belongs to another process), Err(()) access denied.
+pub fn kill(pid: u32, born: i64) -> Result<bool, ()> {
+    let Some(h) = open_same(pid, born, PROCESS_TERMINATE) else {
+        return if open(pid, PROCESS_QUERY_LIMITED_INFORMATION).map(Handle).is_some_and(|_| open(pid, PROCESS_TERMINATE).is_none()) {
+            Err(())
+        } else {
+            Ok(false)
+        };
     };
-    let h = Handle(h);
     unsafe { TerminateProcess(h.0, 1) }.map(|_| true).map_err(|_| ())
 }
 
-pub fn set_priority(pid: u32, class: PROCESS_CREATION_FLAGS) -> bool {
-    open(pid, PROCESS_SET_INFORMATION).map(Handle).is_some_and(|h| unsafe { SetPriorityClass(h.0, class) }.is_ok())
+pub fn set_priority(pid: u32, born: i64, class: PROCESS_CREATION_FLAGS) -> bool {
+    open_same(pid, born, PROCESS_SET_INFORMATION).is_some_and(|h| unsafe { SetPriorityClass(h.0, class) }.is_ok())
 }
 
 pub const PRIORITIES: [(&str, PROCESS_CREATION_FLAGS); 5] = [
@@ -325,8 +385,8 @@ unsafe extern "system" {
 
 /// Freeze (or thaw) every thread of a process: a training run paused while the machine is needed, then
 /// resumed where it was. True if it worked.
-pub fn suspend(pid: u32, on: bool) -> bool {
-    let Some(h) = open(pid, PROCESS_SUSPEND_RESUME).map(Handle) else { return false };
+pub fn suspend(pid: u32, born: i64, on: bool) -> bool {
+    let Some(h) = open_same(pid, born, PROCESS_SUSPEND_RESUME) else { return false };
     (unsafe { if on { NtSuspendProcess(h.0) } else { NtResumeProcess(h.0) } }) == 0
 }
 
@@ -367,7 +427,7 @@ pub fn drives() -> Vec<(String, u64, u64)> {
         }
         let (mut free, mut total) = (0u64, 0u64);
         if unsafe { GetDiskFreeSpaceExW(&path, None, Some(&mut total), Some(&mut free)) }.is_ok() && total > 0 {
-            out.push((String::from_utf16_lossy(root).trim_end_matches('\\').to_string(), total - free, total));
+            out.push((String::from_utf16_lossy(root).trim_end_matches('\\').to_string(), total.saturating_sub(free), total));
         }
     }
     out
@@ -754,7 +814,7 @@ impl Sampler {
         let net = crate::net::totals().unwrap_or_default();
         let prev_thr = std::mem::take(&mut self.prev_thr);
         let mut cur_thr = HashMap::new();
-        let procs: Vec<Proc> = nt_processes(self.split)
+        let mut procs: Vec<Proc> = nt_processes(self.split)
             .into_iter()
             .map(|r| {
                 let key = (r.pid, r.create);
@@ -808,6 +868,11 @@ impl Sampler {
         self.prev = cur;
         self.prev_thr = cur_thr;
         self.cmd.retain(|k, _| live.contains(k));
+        let pids: HashSet<u32> = live.iter().map(|k| k.0).collect();
+        crate::net::retain(|p| pids.contains(&p));
+        if demo() {
+            procs.iter_mut().for_each(demo_mask);
+        }
         procs
     }
 }
