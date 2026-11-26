@@ -4,6 +4,8 @@
 //! (names interned), about 5-10 MB for a full day. Alerts fire only after a threshold has held for a
 //! while, carry the process most responsible, and clear themselves when the condition goes away.
 
+const GIB: f64 = (1u64 << 30) as f64;
+
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
@@ -163,7 +165,11 @@ impl Alerts {
         let commit = tot.commit as f64 / tot.commit_limit.max(1) as f64 * 100.0;
         let g = &tot.gpu;
         let vram = g.mem_used as f64 / g.mem_total.max(1) as f64 * 100.0;
-        let full = tot.drives.iter().find(|d| d.2 > 0 && (d.2 - d.1) as f64 / (d.2 as f64) < 0.05);
+        // almost full in share AND in bytes: 5% of a 20 TB disk is a terabyte, not an emergency
+        let free = |d: &(String, u64, u64)| (d.2 - d.1) as f64;
+        let full = tot.drives.iter().find(|d| d.2 > 0 && free(d) / (d.2 as f64) < 0.05 && free(d) < 20.0 * GIB);
+        // a GPU's own slowdown temperature when the driver says it (laptop GPUs live near 87 °C)
+        let (hot, very_hot) = match g.temp_limit { Some(l) => (l.saturating_sub(5), l), None => (85, 92) };
         #[allow(clippy::type_complexity)]
     let mut checks: Vec<(&'static str, bool, u64, bool, Box<dyn Fn() -> (String, Option<u32>) + '_>)> = vec![
             (
@@ -198,9 +204,9 @@ impl Alerts {
             ),
             (
                 "gputemp",
-                g.temp.is_some_and(|t| t >= 85),
+                g.temp.is_some_and(|t| t >= hot),
                 60,
-                g.temp.is_some_and(|t| t >= 92),
+                g.temp.is_some_and(|t| t >= very_hot),
                 Box::new(move || {
                     let t = g.temp.unwrap_or(0);
                     match top(Field::Gpu) {
@@ -239,7 +245,7 @@ impl Alerts {
                 "drive",
                 full.is_some(),
                 0,
-                full.is_some_and(|d| (d.2 - d.1) as f64 / (d.2 as f64) < 0.02),
+                full.is_some_and(|d| free(d) / (d.2 as f64) < 0.02 && free(d) < 5.0 * GIB),
                 Box::new(move || {
                     // the alert outlives its condition by 10 s: the drive may be gone or freed by now
                     let Some(d) = full else { return ("A drive was almost full: space is back".into(), None) };

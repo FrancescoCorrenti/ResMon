@@ -105,7 +105,25 @@ impl Drop for Scan {
 
 fn cache_path(root: &str) -> PathBuf {
     let tag: String = root.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("ResMon").join(format!("space_{tag}.bin"))
+    let dir = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join("ResMon");
+    // a drive letter is not a disk: another USB stick can get the same letter. The volume serial tells them apart.
+    let Some(serial) = volume_serial(root) else { return dir.join(format!("space_{tag}.bin")) };
+    let p = dir.join(format!("space_{tag}_{serial:08X}.bin"));
+    let old = dir.join(format!("space_{tag}.bin")); // caches written before the serial was part of the name
+    if !p.exists() && old.exists() {
+        let _ = std::fs::rename(&old, &p);
+    }
+    p
+}
+
+fn volume_serial(root: &str) -> Option<u32> {
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+    if root.len() != 2 || !root.ends_with(':') {
+        return None; // not a drive root (the ML storage view)
+    }
+    let mut serial = 0u32;
+    unsafe { GetVolumeInformationW(&HSTRING::from(format!("{root}\\")), None, Some(&mut serial), None, None, None) }.ok()?;
+    Some(serial)
 }
 
 impl Scan {
@@ -276,6 +294,10 @@ impl Scan {
     }
 }
 
+/// Files that are only a placeholder on this disk (OneDrive "online-only", other cloud sync): their size is
+/// what they would take once downloaded, not what they take now. RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE.
+const CLOUD_ONLY: u32 = 0x0040_0000 | 0x0004_0000 | 0x0000_1000;
+
 /// Bytes of the files in `dir`, names of its real subfolders, and whether it could be read.
 fn list(dir: &str) -> (u64, Vec<String>, bool) {
     let pattern = HSTRING::from(format!("{}\\*", dir.trim_end_matches('\\')));
@@ -291,7 +313,7 @@ fn list(dir: &str) -> (u64, Vec<String>, bool) {
             if name != "." && name != ".." && attr & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
                 dirs.push(name);
             }
-        } else {
+        } else if attr & CLOUD_ONLY == 0 {
             files += ((fd.nFileSizeHigh as u64) << 32) | fd.nFileSizeLow as u64;
         }
         if unsafe { FindNextFileW(h, &mut fd) }.is_err() {

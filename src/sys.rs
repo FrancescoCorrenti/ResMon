@@ -328,6 +328,28 @@ pub fn username(pid: u32) -> String {
     get().unwrap_or_else(|| "(access denied)".into())
 }
 
+/// Bytes (received, sent) so far on the physical network adapters only. Virtual ones (Hyper-V and WSL
+/// switches, Docker, most VPN and TAP drivers) carry the same bytes again and would count them twice.
+pub fn net_octets() -> Option<(u64, u64)> {
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+    let mut t: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIfTable2(&mut t) }.is_err() || t.is_null() {
+        return None;
+    }
+    let rows = unsafe { std::slice::from_raw_parts((*t).Table.as_ptr(), (*t).NumEntries as usize) };
+    let (mut rx, mut tx) = (0u64, 0u64);
+    for r in rows {
+        let f = r.InterfaceAndOperStatusFlags._bitfield;
+        let (hardware, filter) = (f & 1 != 0, f & 2 != 0); // HardwareInterface, FilterInterface
+        if hardware && !filter {
+            rx += r.InOctets;
+            tx += r.OutOctets;
+        }
+    }
+    unsafe { FreeMibTable(t as *const _) };
+    Some((rx, tx))
+}
+
 /// False if another ResMon already runs in this session (a named mutex it holds until it exits).
 pub fn first_instance() -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
@@ -449,8 +471,9 @@ impl Pdh {
         let mut counters = Vec::new();
         for p in paths {
             let mut c = PDH_HCOUNTER::default();
+            // a counter this Windows lacks (an old build, no network adapter...) reads as empty, the rest still works
             if unsafe { PdhAddEnglishCounterW(q, &HSTRING::from(*p), 0, &mut c) } != 0 {
-                return None;
+                c = PDH_HCOUNTER::default();
             }
             counters.push(c);
         }
@@ -465,6 +488,9 @@ impl Pdh {
     /// (instance name, value) for every instance of counter i.
     fn array(&self, i: usize, large: bool) -> Vec<(String, f64)> {
         let fmt = if large { PDH_FMT_LARGE } else { PDH_FMT_DOUBLE };
+        if self.counters[i].is_invalid() {
+            return Vec::new();
+        }
         let (mut size, mut count) = (0u32, 0u32);
         unsafe { PdhGetFormattedCounterArrayW(self.counters[i], fmt, &mut size, &mut count, None) };
         if size == 0 {
@@ -513,25 +539,107 @@ pub struct Gpu {
     pub fan: Option<u32>,             // %
     pub pcie: Option<(u32, u32, u32)>, // gen, width now, max width
     pub throttle: Vec<&'static str>,  // why the clocks are held down (idle and app settings left out)
+    pub shared: bool,                 // integrated GPU: its memory is shared system memory, not VRAM
+    pub temp_limit: Option<u32>,      // °C where this GPU starts slowing itself down (NVML)
+}
+
+/// "NVIDIA GeForce RTX 4070", "AMD Radeon(TM) Graphics", "Intel(R) UHD Graphics 620" without the
+/// trademark noise and the vendor prefix, for a short subtitle.
+pub fn short_gpu_name(n: &str) -> String {
+    let s = n.replace("(TM)", "").replace("(R)", "");
+    let s = ["NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel "].iter().find_map(|p| s.strip_prefix(p)).unwrap_or(&s);
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A display adapter as DXGI sees it: any vendor, integrated or discrete.
+#[derive(Clone)]
+struct Adapter {
+    name: String,
+    luid: String, // as in PDH instance names: "luid_0x00000000_0x0000D1F2"
+    dedicated: u64,
+    shared: u64,
+}
+
+/// Hardware adapters (the software renderer left out), the main one first: the most dedicated memory, i.e.
+/// the discrete GPU on a laptop with two, or the integrated one when it is the only GPU.
+fn adapters() -> Vec<Adapter> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
+    let Ok(f) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return Vec::new() };
+    let mut out = Vec::new();
+    for i in 0.. {
+        let Ok(a) = (unsafe { f.EnumAdapters1(i) }) else { break };
+        let Ok(d) = (unsafe { a.GetDesc1() }) else { continue };
+        if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414 {
+            continue; // Microsoft Basic Render Driver
+        }
+        let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+        out.push(Adapter {
+            name: String::from_utf16_lossy(&d.Description[..n]).trim().to_string(),
+            luid: format!("luid_0x{:08X}_0x{:08X}", d.AdapterLuid.HighPart as u32, d.AdapterLuid.LowPart),
+            dedicated: d.DedicatedVideoMemory as u64,
+            shared: d.SharedSystemMemory as u64,
+        });
+    }
+    out.sort_by_key(|a| std::cmp::Reverse(a.dedicated));
+    out
+}
+
+/// GPU load and memory for any vendor from the PDH GPU counters (what Task Manager shows), for machines
+/// without NVML (AMD, Intel, integrated graphics).
+struct PdhGpu {
+    q: Pdh,
+    main: Adapter,
+    uma: bool, // integrated: no dedicated memory to speak of, it works in shared system memory
+}
+
+impl PdhGpu {
+    fn new(main: Adapter) -> Option<PdhGpu> {
+        let q = Pdh::new(&[r"\GPU Engine(*)\Utilization Percentage", r"\GPU Adapter Memory(*)\Dedicated Usage", r"\GPU Adapter Memory(*)\Shared Usage"])?;
+        let uma = main.dedicated < 512 << 20;
+        Some(PdhGpu { q, main, uma })
+    }
+
+    fn sample(&self) -> Gpu {
+        self.q.collect();
+        let mut per_engine: HashMap<String, f64> = HashMap::new(); // summed over processes per engine type, then max
+        for (inst, v) in self.q.array(0, false) {
+            if inst.contains(&self.main.luid) {
+                let eng = inst.rsplit("engtype_").next().unwrap_or("").to_string();
+                *per_engine.entry(eng).or_default() += v;
+            }
+        }
+        let util = per_engine.values().fold(0.0f64, |m, &v| m.max(v)).min(100.0) as f32;
+        let mem = |i: usize| self.q.array(i, true).into_iter().filter(|(n, _)| n.contains(&self.main.luid)).map(|(_, v)| v as u64).sum::<u64>();
+        let (mem_used, mem_total) = if self.uma { (mem(2), self.main.shared) } else { (mem(1), self.main.dedicated) };
+        Gpu { name: self.main.name.clone(), util: Some(util), mem_used, mem_total, shared: self.uma, ..Default::default() }
+    }
 }
 
 struct Nvml {
     nvml: nvml_wrapper::Nvml,
     name: String,
+    index: u32,
 }
 
 impl Nvml {
-    fn new() -> Result<Nvml, String> {
+    /// NVML for the main adapter, if it is an NVIDIA one: temperature, power, fan, clocks, slowdown reasons.
+    fn new(main: Option<&Adapter>) -> Result<Nvml, String> {
         let nvml = nvml_wrapper::Nvml::init().map_err(|e| format!("NVML: {e}"))?;
-        let name = nvml.device_by_index(0).and_then(|d| d.name()).map_err(|e| format!("NVML: {e}"))?;
-        Ok(Nvml { nvml, name })
+        let n = nvml.device_count().map_err(|e| format!("NVML: {e}"))?;
+        // the NVML device that is the main adapter (names match: "NVIDIA GeForce RTX ..."); else the first
+        let pick = (0..n)
+            .filter_map(|i| Some((i, nvml.device_by_index(i).ok()?.name().ok()?)))
+            .find(|(_, name)| main.is_none_or(|a| a.name == *name))
+            .ok_or("NVML: no device for the main GPU")?;
+        Ok(Nvml { nvml, name: pick.1, index: pick.0 })
     }
 
     fn sample(&self) -> Gpu {
         let mut g = Gpu { name: self.name.clone(), ..Default::default() };
-        if let Ok(d) = self.nvml.device_by_index(0) {
+        if let Ok(d) = self.nvml.device_by_index(self.index) {
             g.util = d.utilization_rates().ok().map(|u| u.gpu as f32);
             g.temp = d.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu).ok();
+            g.temp_limit = d.temperature_threshold(nvml_wrapper::enum_wrappers::device::TemperatureThreshold::Slowdown).ok();
             g.power = d.power_usage().ok().map(|mw| mw as f32 / 1000.0);
             if let Ok(m) = d.memory_info() {
                 (g.mem_used, g.mem_total) = (m.used, m.total);
@@ -665,6 +773,9 @@ fn push(d: &mut VecDeque<f32>, v: f32) {
 pub struct Sampler {
     pub ncpu: usize,
     nvml: Option<Nvml>,
+    pdh_gpu: Option<PdhGpu>, // any vendor, when the main GPU has no NVML
+    gpu_uma: bool,           // the main GPU is integrated (shared memory only)
+    net_prev: Option<(u64, u64, Instant)>, // physical adapters' byte counters at the last tick
     gpu_err: Option<String>,
     io: Option<Pdh>,  // disk + network rates, every tick
     gpu: Option<Pdh>, // per-process GPU, only with the process table
@@ -682,14 +793,19 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new() -> Sampler {
-        let (nvml, gpu_err) = match Nvml::new() {
-            Ok(n) => (Some(n), None),
-            Err(e) => (None, Some(e)),
-        };
+        let main = adapters().into_iter().next();
+        let gpu_uma = main.as_ref().is_some_and(|a| a.dedicated < 512 << 20);
+        // RESMON_NO_NVML: run the vendor-neutral path on an NVIDIA machine, to check it
+        let nvml = if std::env::var_os("RESMON_NO_NVML").is_some() { None } else { Nvml::new(main.as_ref()).ok() };
+        let pdh_gpu = if nvml.is_none() { main.clone().and_then(PdhGpu::new) } else { None };
+        let gpu_err = (nvml.is_none() && pdh_gpu.is_none()).then(|| if main.is_none() { "No GPU found" } else { "GPU counters not available" }.to_string());
         let cores = core_times();
         Sampler {
-            ncpu: cores.len().max(1),
+            // every processor group: process CPU times cover all of them. ponytail: per-core bars and the total
+            // still read group 0 only (class 8); machines with >64 threads need the per-group query for those
+            ncpu: (unsafe { GetActiveProcessorCount(0xFFFF) } as usize).max(cores.len()).max(1),
             nvml,
+            pdh_gpu,
             gpu_err,
             net_err: None,
             net_on: false,
@@ -703,7 +819,9 @@ impl Sampler {
                 r"\LogicalDisk(*)\Disk Read Bytes/sec",
                 r"\LogicalDisk(*)\Disk Write Bytes/sec",
             ]),
-            gpu: Pdh::new(&[r"\GPU Engine(*)\Utilization Percentage", r"\GPU Process Memory(*)\Dedicated Usage"]),
+            gpu: Pdh::new(&[r"\GPU Engine(*)\Utilization Percentage", r"\GPU Process Memory(*)\Dedicated Usage", r"\GPU Process Memory(*)\Shared Usage"]),
+            gpu_uma,
+            net_prev: None,
             cores,
             prev: HashMap::new(),
             prev_t: None,
@@ -725,12 +843,29 @@ impl Sampler {
         let cpu = per_core.iter().sum::<f32>() / per_core.len().max(1) as f32;
         let (ram_used, ram_total) = memory();
         let (commit, commit_limit) = commit_bytes();
-        let gpu = self.nvml.as_ref().map(|n| n.sample()).unwrap_or_default();
+        let gpu = match (&self.nvml, &self.pdh_gpu) {
+            (Some(n), _) => n.sample(),
+            (None, Some(p)) => p.sample(),
+            _ => Gpu::default(),
+        };
         let (mut disk_r, mut disk_w, mut net_d, mut net_u) = (0.0, 0.0, 0.0, 0.0);
         let mut drive_io = Vec::new();
         if let Some(p) = &self.io {
             p.collect();
             (disk_r, disk_w, net_d, net_u) = (p.sum(0), p.sum(1), p.sum(2), p.sum(3));
+        }
+        // physical adapters only (PDH's Network Interface(*) also lists the virtual ones, double counting)
+        if let Some((rx, tx)) = net_octets() {
+            let now = Instant::now();
+            if let Some((rx0, tx0, t0)) = self.net_prev {
+                let dt = (now - t0).as_secs_f64().max(1e-3);
+                (net_d, net_u) = (rx.saturating_sub(rx0) as f64 / dt, tx.saturating_sub(tx0) as f64 / dt);
+            } else {
+                (net_d, net_u) = (0.0, 0.0);
+            }
+            self.net_prev = Some((rx, tx, now));
+        }
+        if let Some(p) = &self.io {
             let w: HashMap<String, f64> = p.array(5, false).into_iter().collect();
             drive_io = p.array(4, false).into_iter().filter(|(n, _)| n.ends_with(':')).map(|(n, r)| { let wv = w.get(&n).copied().unwrap_or(0.0); (n, r, wv) }).collect();
         }
@@ -794,17 +929,22 @@ impl Sampler {
             let mut per_engine: HashMap<(u32, String), f64> = HashMap::new(); // summed per engine type, then max (Task Manager rule)
             for (inst, v) in p.array(0, false) {
                 if let Some(pid) = pdh_pid(&inst) {
-                    let eng = inst.rsplit("engtype_").next().unwrap_or("").to_string();
-                    *per_engine.entry((pid, eng)).or_default() += v;
+                    // per adapter and engine type: the same engine type on two GPUs must not add up
+                    let adapter = inst.find("luid_").map(|s| &inst[s..]).and_then(|s| s.split("_eng_").next()).unwrap_or("");
+                    let eng = inst.rsplit("engtype_").next().unwrap_or("");
+                    *per_engine.entry((pid, format!("{adapter}/{eng}"))).or_default() += v;
                 }
             }
             for ((pid, _), v) in per_engine {
                 let e = gutil.entry(pid).or_default();
                 *e = e.max(v).min(100.0);
             }
-            for (inst, v) in p.array(1, true) {
-                if let Some(pid) = pdh_pid(&inst) {
-                    *gmem.entry(pid).or_default() += v;
+            // an integrated GPU has no dedicated memory: what processes hold there is shared memory
+            for i in if self.gpu_uma { vec![1, 2] } else { vec![1] } {
+                for (inst, v) in p.array(i, true) {
+                    if let Some(pid) = pdh_pid(&inst) {
+                        *gmem.entry(pid).or_default() += v;
+                    }
                 }
             }
         }
@@ -902,8 +1042,11 @@ pub fn cursor_pos() -> (i32, i32) {
     (p.x, p.y)
 }
 
+/// The primary mouse button: GetAsyncKeyState reads physical buttons, and left-handed users swap them.
 pub fn left_button_down() -> bool {
-    (unsafe { GetAsyncKeyState(0x01) } as u16 & 0x8000) != 0
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { 0x02 } else { 0x01 };
+    (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
 pub fn window_rect(h: HWND) -> Option<(i32, i32, i32, i32)> {
@@ -1021,17 +1164,39 @@ mod tests {
         let mut h = History::default();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let t = s.sample_totals(&mut h);
-        assert_eq!(t.per_core.len(), s.ncpu);
+        assert!(!t.per_core.is_empty() && t.per_core.len() <= s.ncpu);
         assert!((0.0..=100.0).contains(&t.cpu));
         assert!(t.ram_used > 0 && t.ram_used < t.ram_total);
         assert!(t.commit > 0 && t.commit <= t.commit_limit);
         assert!(!t.drives.is_empty());
-        assert!(t.drives.iter().any(|d| d.0 == "C:"));
+        let sys_drive = std::env::var("SystemDrive").unwrap_or("C:".into()); // not always C:
+        assert!(t.drives.iter().any(|d| d.0.eq_ignore_ascii_case(&sys_drive)));
         let ps = s.sample_procs();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let ps2 = s.sample_procs();
         assert!(ps.len() > 20 && ps2.len() > 20);
         assert!(ps2.iter().map(|p| p.cpu).sum::<f64>() <= 101.0);
         assert!(pdh_pid("pid_1234_luid_0x0_phys_0_eng_0_engtype_3D") == Some(1234));
+    }
+
+    #[test]
+    fn gpu_names_and_vendor_neutral_path() {
+        assert_eq!(short_gpu_name("NVIDIA GeForce RTX 3060"), "RTX 3060");
+        assert_eq!(short_gpu_name("AMD Radeon(TM) Graphics"), "Graphics");
+        assert_eq!(short_gpu_name("Intel(R) UHD Graphics 620"), "UHD Graphics 620");
+        // whatever GPU this machine has, the PDH path must see the same memory size as DXGI, and, on an
+        // NVIDIA card, about the VRAM NVML reports
+        let Some(main) = adapters().into_iter().next() else { return };
+        let Some(p) = PdhGpu::new(main.clone()) else { return };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let g = p.sample();
+        assert!(g.util.is_some_and(|u| (0.0..=100.0).contains(&u)));
+        assert!(g.mem_total > 0 && g.mem_used <= g.mem_total);
+        if let Ok(n) = Nvml::new(Some(&main)) {
+            let nv = n.sample();
+            let (a, b) = (g.mem_used as f64, nv.mem_used as f64);
+            eprintln!("{}: PDH {:.2} GB of {:.2}, NVML {:.2} GB, load {:?}", main.name, a / 1e9, g.mem_total as f64 / 1e9, b / 1e9, g.util);
+            assert!((a - b).abs() < 0.25 * b.max(1e9), "PDH {a} vs NVML {b}");
+        }
     }
 }

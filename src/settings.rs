@@ -88,6 +88,9 @@ impl Settings {
                 _ => {}
             }
         }
+        // a hand-edited file: unknown or repeated bars would widen the tab with nothing to draw
+        let mut seen = Vec::new();
+        s.tab.retain(|k| TAB_BARS.iter().any(|b| b.0 == k) && !seen.contains(k) && { seen.push(k.clone()); true });
         if s.tab.is_empty() {
             s.tab = Settings::default().tab;
         }

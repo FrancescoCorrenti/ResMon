@@ -7,7 +7,7 @@ edition = "2024"
 egui = { version = "0.37", default-features = false }
 egui-winit = { version = "0.37", default-features = false, features = ["clipboard"] }
 nvml-wrapper = "0.13.0"
-windows = { version = "0.62.2", features = ["Win32_System_Time", "Win32_System_Diagnostics_Etw", "Win32_System_Diagnostics_Debug", "Win32_UI_Shell", "Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Registry", "Wdk_System_SystemInformation", "Wdk_System_Threading", "Win32_System_Kernel"] }
+windows = { version = "0.62.2", features = ["Win32_System_Time", "Win32_System_Diagnostics_Etw", "Win32_System_Diagnostics_Debug", "Win32_Graphics_Dxgi", "Win32_System_RemoteDesktop", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Graphics_Dxgi_Common", "Win32_UI_Shell", "Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Registry", "Wdk_System_SystemInformation", "Wdk_System_Threading", "Win32_System_Kernel"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [profile.release]

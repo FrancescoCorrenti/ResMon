@@ -31,7 +31,9 @@ use windows::Win32::Foundation::HWND;
 
 const REFLOW: f64 = 8.0; // seconds between two treemap reflows
 const TAB: Vec2 = vec2(34.0, 178.0); // docked tab (logical px): three bars with their icons
-const PANEL: Vec2 = vec2(264.0, 790.0); // hover panel
+const PANEL_W: f32 = 264.0; // hover panel; its height follows its content (panel_size)
+const PANEL_PITCH: f32 = 88.0; // one gauge in the panel, when the screen is tall enough
+const PANEL_MIN_PITCH: f32 = 56.0; // the closest gauges get on a short screen
 const FULL: Vec2 = vec2(1440.0, 900.0); // full view (clamped to the work area)
 const UI_ANIM: f64 = 0.28; // shell transitions
 const FADE: f64 = 0.22; // full view content fade
@@ -68,6 +70,15 @@ fn fmt_bytes(b: f64) -> String {
         b /= 1024.0;
     }
     unreachable!()
+}
+
+/// "23.4 / 31.8 GB", "0.4 / 2.0 GB", "812 / 1024 MB": used in the unit of the total, whatever the size.
+fn fmt_of(used: f64, total: f64) -> String {
+    let t = fmt_bytes(total);
+    let unit = t.rsplit(' ').next().unwrap_or("B");
+    let k = 1024f64.powi(["B", "KB", "MB", "GB", "TB"].iter().position(|u| *u == unit).unwrap_or(0) as i32);
+    let u = used.max(0.0) / k;
+    if u >= 100.0 { format!("{u:.0} / {t}") } else { format!("{u:.1} / {t}") }
 }
 
 fn fmt_rate(b: f64) -> String {
@@ -385,10 +396,10 @@ const NO_END: [&str; 13] = [
     "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
     "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe", "dwm.exe",
 ];
-const NO_PAUSE: [&str; 19] = [
+const NO_PAUSE: [&str; 18] = [
     "system", "registry", "memory compression", "secure system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
     "services.exe", "lsass.exe", "lsaiso.exe", "svchost.exe", "dwm.exe", "explorer.exe", "fontdrvhost.exe", "sihost.exe",
-    "ctfmon.exe", "audiodg.exe", "resmon.exe",
+    "ctfmon.exe", "audiodg.exe",
 ];
 
 struct KillAsk {
@@ -405,6 +416,7 @@ struct App {
     mode: Mode,
     trans: Option<Trans>,
     anchor: (i32, i32),
+    screen: (i32, i32, i32, i32, f32), // work area and scale of the anchor's monitor, to notice a display change
     bounds: (i32, i32, i32, i32),
     enforce_until: f64,
     drag: bool,
@@ -493,6 +505,7 @@ impl App {
             mode: Mode::Tab,
             trans: None,
             anchor,
+            screen: (0, 0, 0, 0, 0.0),
             bounds: (0, 0, 0, 0),
             enforce_until: 0.0,
             drag: false,
@@ -555,7 +568,7 @@ impl App {
                 (w, h, (t + b - h) / 2.0)
             }
             _ => {
-                let v = if mode == Mode::Tab { self.tab_size() } else { PANEL };
+                let v = if mode == Mode::Tab { self.tab_size() } else { self.panel_size() };
                 let (w, h) = (v.x * s, (v.y * s).min(b - t));
                 (w, h, (self.anchor.1 as f32 - h / 2.0).clamp(t, b - h))
             }
@@ -574,7 +587,7 @@ impl App {
     fn face_size(&self, mode: Mode) -> Vec2 {
         match mode {
             Mode::Tab => self.tab_size(),
-            Mode::Panel => PANEL,
+            Mode::Panel => self.panel_size(),
             Mode::Full => FULL,
         }
     }
@@ -1194,11 +1207,16 @@ fn draw_gauge(ui: &Ui, r: Rect, g: &Gauge, small: bool, selected: bool) {
     }
     match g.cores {
         Some(cores) if !cores.is_empty() => {
-            let n = cores.len() as f32;
-            let bw = (w - 3.0 * (n - 1.0)) / n;
-            for (i, &v) in cores.iter().enumerate() {
+            // one bar per logical CPU while they fit (at least 4 px); on CPUs with many threads, neighbours are
+            // averaged into one bar so a 64-thread machine still gets readable bars, not 1-px slivers
+            let per = (cores.len() as f32 * 6.0 / w).ceil().max(1.0) as usize;
+            let binned: Vec<f32> = cores.chunks(per).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect();
+            let n = binned.len() as f32;
+            let gap = if w / n > 10.0 { 3.0 } else { 1.0 };
+            let bw = (w - gap * (n - 1.0)) / n;
+            for (i, &v) in binned.iter().enumerate() {
                 // values jump to each sample: easing them kept the CPU renderer at ~40 fps (half a core)
-                let tr = Rect::from_min_size(pos2(inner.left() + i as f32 * (bw + 3.0), y + 1.0), vec2(bw, 12.0));
+                let tr = Rect::from_min_size(pos2(inner.left() + i as f32 * (bw + gap), y + 1.0), vec2(bw, 12.0));
                 p.rect_filled(tr, 2.0, th().line);
                 let fh = (v / 100.0).clamp(0.1, 1.0) * 12.0;
                 p.rect_filled(Rect::from_min_max(pos2(tr.left(), tr.bottom() - fh), tr.max), 2.0, g.s1.1);
@@ -1225,6 +1243,13 @@ const ML: &str = "ML storage";
 
 /// Where ML work piles up on disk: model and package caches, experiment logs, and any folder at the top
 /// of a drive named like models / checkpoints / datasets / wandb. Only the ones that exist.
+/// Whether this machine has any ML cache or model folder at all: the ML storage card is left out otherwise
+/// (looked up once: it reads every drive root).
+fn has_ml() -> bool {
+    static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H.get_or_init(|| !ml_folders().is_empty())
+}
+
 fn ml_folders() -> Vec<String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let home = env("USERPROFILE").unwrap_or_default();
@@ -1237,12 +1262,24 @@ fn ml_folders() -> Vec<String> {
         format!(r"{home}\.lmstudio\models"),
         env("OLLAMA_MODELS").unwrap_or(format!(r"{home}\.ollama\models")),
         format!(r"{home}\.keras"),
-        format!(r"{local}\pip\cache"),
+        env("PIP_CACHE_DIR").unwrap_or(format!(r"{local}\pip\cache")),
         format!(r"{home}\anaconda3\pkgs"),
         format!(r"{home}\miniconda3\pkgs"),
         format!(r"{home}\.conda\pkgs"),
     ]
     .into();
+    // caches moved by their usual variables, and conda installed for all users
+    for k in ["HF_HUB_CACHE", "HF_DATASETS_CACHE", "TRANSFORMERS_CACHE", "XDG_CACHE_HOME"] {
+        c.extend(env(k));
+    }
+    if let Some(dirs) = env("CONDA_PKGS_DIRS") {
+        c.extend(dirs.split(';').map(str::trim).filter(|d| !d.is_empty()).map(String::from));
+    }
+    let program_data = env("ProgramData").unwrap_or(r"C:\ProgramData".into());
+    for d in ["anaconda3", "miniconda3", "miniforge3"] {
+        c.push(format!(r"{program_data}\{d}\pkgs"));
+        c.push(format!(r"{home}\{d}\pkgs"));
+    }
     for (d, _, _) in sys::drives() {
         if let Ok(rd) = std::fs::read_dir(format!(r"{d}\")) {
             for e in rd.flatten() {
@@ -1412,7 +1449,8 @@ fn draw_drives(ui: &Ui, r: Rect, drives: &[(String, u64, u64)], small: bool, sel
     let title = if small { "DRIVES" } else { "DRIVES · click for folders" };
     text(&p, inner.left_top() + vec2(18.0, 0.0), Align2::LEFT_TOP, if selected.is_some() { "DRIVES · FOLDERS" } else { title }, bold(10.0), ic, inner.width() - 18.0);
     let mut y = inner.top() + 22.0;
-    let step = if small { 17.0 } else { 18.0 };
+    // rows close up when a machine has more drives than fit at the normal spacing
+    let step = (if small { 17.0f32 } else { 18.0 }).min((inner.bottom() - y) / drives.len().max(1) as f32).max(11.0);
     let mut rows = Vec::new();
     for (mount, used, total) in drives {
         let cy = y + 6.0;
@@ -1698,7 +1736,6 @@ impl App {
     fn gauges(&self, small: bool) -> Vec<(&'static str, Gauge<'_>)> {
         let Some(s) = &self.tot else { return Vec::new() };
         let h = &self.hist;
-        let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
         let mut v = vec![
             ("cpu", Gauge { icon: I_CPU, vi: "", si: "", title: "CPU".into(), value: format!("{:.0}%", s.cpu), sub: String::new(), cores: Some(&s.per_core), s1: (&h.cpu, ac().cpu), s2: None, top: 100.0 }),
             (
@@ -1708,7 +1745,7 @@ impl App {
                     vi: "",
                     si: "",
                     title: if !small && self.metric == Field::Private { "MEMORY · PRIVATE".into() } else { "MEMORY".into() },
-                    value: format!("{:.1} / {}", gb(s.ram_used), fmt_bytes(s.ram_total as f64)),
+                    value: fmt_of(s.ram_used as f64, s.ram_total as f64),
                     sub: format!("Commit {} of {}", fmt_bytes(s.commit as f64), fmt_bytes(s.commit_limit as f64)),
                     cores: None,
                     s1: (&h.ram, ac().ram),
@@ -1725,7 +1762,7 @@ impl App {
                     vi: "",
                     si: "",
                     title: "COMMIT".into(),
-                    value: format!("{:.1} / {}", gb(s.commit), fmt_bytes(s.commit_limit as f64)),
+                    value: fmt_of(s.commit as f64, s.commit_limit as f64),
                     sub: format!("{:.0}% of the commit limit", s.commit as f64 / s.commit_limit.max(1) as f64 * 100.0),
                     cores: None,
                     s1: (&h.commit, ac().commit),
@@ -1741,13 +1778,19 @@ impl App {
                 let held = (!g.throttle.is_empty() && u > 30.0).then(|| format!("slowed: {}", g.throttle.join(", ")));
                 let power = g.power.map(|w| match g.power_limit { Some(l) => format!("{w:.0}/{l:.0} W"), None => format!("{w:.0} W") });
                 let extra: Vec<String> = [held, g.temp.map(|t| format!("{t}°C")), power, g.fan.map(|f| format!("fan {f}%"))].into_iter().flatten().collect();
-                (format!("{u:.0}%"), if extra.is_empty() { g.name.clone() } else { extra.join(" · ") })
+                (format!("{u:.0}%"), if extra.is_empty() { sys::short_gpu_name(&g.name) } else { extra.join(" · ") })
             }
-            None => ("n/a".into(), s.gpu_err.clone().unwrap_or_else(|| "No NVIDIA GPU".into())),
+            None => ("n/a".into(), s.gpu_err.clone().unwrap_or_else(|| "No GPU data".into())),
         };
         v.push(("gpu", Gauge { icon: I_GPU, vi: "", si: "", title: "GPU".into(), value: gv, sub: gs, cores: None, s1: (&h.gpu, ac().gpu), s2: None, top: 100.0 }));
-        let (vv, vs) = if g.mem_total > 0 { (format!("{:.1} / {}", gb(g.mem_used), fmt_bytes(g.mem_total as f64)), g.name.replace("NVIDIA GeForce ", "")) } else { ("-".into(), String::new()) };
-        v.push(("vram", Gauge { icon: I_VRAM, vi: "", si: "", title: "VRAM".into(), value: vv, sub: vs, cores: None, s1: (&h.vram, ac().vram), s2: None, top: 100.0 }));
+        let (vv, vs) = if g.mem_total > 0 {
+            let name = sys::short_gpu_name(&g.name);
+            (fmt_of(g.mem_used as f64, g.mem_total as f64), if g.shared { format!("{name} · shared memory") } else { name })
+        } else {
+            ("-".into(), String::new())
+        };
+        let vt = if g.shared { "GPU MEMORY" } else { "VRAM" };
+        v.push(("vram", Gauge { icon: I_VRAM, vi: "", si: "", title: vt.into(), value: vv, sub: vs, cores: None, s1: (&h.vram, ac().vram), s2: None, top: 100.0 }));
         let mx = |a: &VecDeque<f32>, b: &VecDeque<f32>, floor: f32| a.iter().chain(b).fold(floor, |m, &x| m.max(x));
         v.push((
             "disk",
@@ -1786,9 +1829,16 @@ impl App {
         v
     }
 
+    /// The hover panel: as tall as its gauges and drive list (geometry() caps it at the screen height).
+    fn panel_size(&self) -> Vec2 {
+        let drives = self.tot.as_ref().map_or(0, |s| s.drives.len()) as f32;
+        vec2(PANEL_W, 36.0 + self.gauges(true).len() as f32 * PANEL_PITCH + 31.0 + 17.0 * drives + 44.0)
+    }
+
     /// The docked tab: as wide as its bars need.
     fn tab_size(&self) -> Vec2 {
-        vec2(16.0 + 9.0 * self.cfg.tab.len().max(1) as f32, TAB.y)
+        let n = if self.tot.is_some() { self.tab_bars().len() } else { self.cfg.tab.len() };
+        vec2(16.0 + 9.0 * n.max(1) as f32, TAB.y)
     }
 
     /// (fill %, colour, icon) of each bar of the docked tab. Rates are against the peak of the last minute.
@@ -1802,8 +1852,9 @@ impl App {
             .filter_map(|k| match k.as_str() {
                 "cpu" => Some((s.cpu, ac().cpu, I_CPU)),
                 "ram" => Some((s.ram_used as f32 / s.ram_total.max(1) as f32 * 100.0, ac().ram, I_RAM)),
-                "gpu" => Some((s.gpu.util.unwrap_or(0.0), ac().gpu, I_GPU)),
-                "vram" => Some((s.gpu.mem_used as f32 / s.gpu.mem_total.max(1) as f32 * 100.0, ac().vram, I_VRAM)),
+                // a machine without GPU data gets no permanently empty GPU bars
+                "gpu" => s.gpu.util.map(|u| (u, ac().gpu, I_GPU)),
+                "vram" => (s.gpu.mem_total > 0).then(|| (s.gpu.mem_used as f32 / s.gpu.mem_total as f32 * 100.0, ac().vram, I_VRAM)),
                 "disk" => Some(((s.disk_r + s.disk_w) as f32 / peak(&h.disk_r, &h.disk_w, 1048576.0) * 100.0, ac().disk, I_DISK)),
                 "net" => Some(((s.net_d + s.net_u) as f32 / peak(&h.net_d, &h.net_u, 102400.0) * 100.0, ac().net, I_NET)),
                 _ => None,
@@ -1897,14 +1948,23 @@ impl App {
             }
         }
         let gauges = self.gauges(true);
-        let mut y = inner.top() + 26.0;
+        // the window is as tall as its content (panel_size), but never taller than the screen: on a short
+        // screen the gauges get closer, and the drive list goes if even that is not enough
+        let top = inner.top() + 26.0;
+        let room = inner.bottom() - 40.0 - top;
+        let dh = self.tot.as_ref().map_or(0.0, |s| 31.0 + 17.0 * s.drives.len() as f32);
+        let n = gauges.len().max(1) as f32;
+        let show_drives = room - dh >= n * PANEL_MIN_PITCH;
+        let pitch = (((room - if show_drives { dh } else { 0.0 }) / n).min(PANEL_PITCH)).max(PANEL_MIN_PITCH);
+        let mut y = top;
         for (_, g) in &gauges {
-            let gr = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), 82.0));
+            let gr = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), pitch - 6.0));
             draw_gauge(&ui, gr, g, true, false);
-            y += 88.0;
+            y += pitch;
         }
-        if let Some(s) = &self.tot {
-            let dh = 31.0 + 17.0 * s.drives.len() as f32;
+        if let Some(s) = &self.tot
+            && show_drives
+        {
             draw_drives(&ui, Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), dh)), &s.drives, true, None);
         }
         let foot = Rect::from_min_max(pos2(inner.left(), inner.bottom() - 34.0), inner.max);
@@ -2032,15 +2092,20 @@ impl App {
     fn header(&mut self, ui: &Ui, r: Rect, now: f64) {
         let mut card_act: Option<(Act, &'static str)> = None; // right click on a card
         // ML storage: its walk starts the first time the card is shown and is kept like a drive's
-        if self.cfg.shows("ml") && !self.scans.contains_key(ML) && self.space.as_ref().is_none_or(|s| s.scan.root != ML) {
+        if self.cfg.shows("ml") && has_ml() && !self.scans.contains_key(ML) && self.space.as_ref().is_none_or(|s| s.scan.root != ML) {
             let c = ui.ctx().clone();
             self.scans.insert(ML.into(), space::Scan::open_many(ML, &ml_folders(), move || c.request_repaint()));
         }
         let gauges = self.gauges(false);
         // the measure cards, then one card per drive
         let drives: Vec<(String, u64, u64)> = if self.cfg.shows("drives") { self.tot.as_ref().map(|t| t.drives.clone()).unwrap_or_default() } else { Vec::new() };
-        let ml = self.cfg.shows("ml");
-        let n = (gauges.len() + drives.len() + ml as usize).max(1) as f32;
+        let ml = self.cfg.shows("ml") && has_ml();
+        // one card per drive while cards stay readable; with many drives (or a narrow screen) they fold into
+        // a single card listing them all, each row clickable
+        let card_w = |k: usize| (r.width() - 10.0 * (k as f32 - 1.0)) / k as f32;
+        let fold = drives.len() > 1 && card_w(gauges.len() + drives.len() + ml as usize) < 120.0;
+        let n_drive_cards = if fold { 1 } else { drives.len() };
+        let n = (gauges.len() + n_drive_cards + ml as usize).max(1) as f32;
         let w = (r.width() - 10.0 * (n - 1.0)) / n;
         let mut pick = None;
         for (i, (key, g)) in gauges.iter().enumerate() {
@@ -2095,7 +2160,20 @@ impl App {
         let mut drive = None;
         let io = self.tot.as_ref().map(|t| t.drive_io.clone()).unwrap_or_default();
         let open = self.space.as_ref().map(|s| s.scan.root.clone());
-        for (j, (mount, used, total)) in drives.iter().enumerate() {
+        if fold {
+            let dr = Rect::from_min_size(pos2(r.left() + gauges.len() as f32 * (w + 10.0), r.top()), vec2(w, r.height()));
+            let sel = open.as_deref().filter(|o| drives.iter().any(|d| d.0 == *o));
+            for (mount, row) in draw_drives(ui, dr, &drives, true, sel) {
+                let resp = ui.interact(row, Id::unique(("drive-row", mount.as_str())), Sense::click()).on_hover_text(format!("{mount}: what fills it, folder by folder"));
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    drive = Some(mount);
+                }
+            }
+        }
+        for (j, (mount, used, total)) in drives.iter().enumerate().filter(|_| !fold) {
             let i = gauges.len() + j;
             let dr = Rect::from_min_size(pos2(r.left() + i as f32 * (w + 10.0), r.top()), vec2(w, r.height()));
             let (rd, wr) = io.iter().find(|d| &d.0 == mount).map_or((0.0, 0.0), |d| (d.1, d.2));
@@ -2114,7 +2192,7 @@ impl App {
             }
         }
         if ml {
-            let i = gauges.len() + drives.len();
+            let i = gauges.len() + n_drive_cards;
             let mr = Rect::from_min_size(pos2(r.left() + i as f32 * (w + 10.0), r.top()), vec2(w, r.height()));
             let open = self.space.as_ref().is_some_and(|s| s.scan.root == ML);
             let scan = if open { self.space.as_ref().map(|s| &s.scan) } else { self.scans.get(ML) };
@@ -2920,6 +2998,11 @@ impl App {
                     Act::Suspend(on) => {
                         let guard: &[&str] = if on { &NO_PAUSE } else { &[] };
                         let Some(live) = self.act_on(&pids, "Pausing", guard, now) else { return };
+                        // ResMon itself, by pid (Windows' own Resource Monitor is also called resmon.exe)
+                        if on && live.iter().any(|p| p.0 == std::process::id()) {
+                            self.toast("Pausing ResMon would leave nothing to resume it with: not done", true, now);
+                            return;
+                        }
                         // NtSuspendProcess nests: touch only the ones whose state changes, so one Resume undoes one Pause
                         let todo: Vec<_> = live.into_iter().filter(|p| self.suspended.contains(&p.0) != on).collect();
                         let mut ok = 0;
@@ -3369,6 +3452,32 @@ impl App {
                 Ok("panel") => self.go(Mode::Panel, now),
                 Ok("full") => self.go(Mode::Full, now),
                 _ => {}
+            }
+        }
+        // a monitor unplugged, a laptop undocked, a resolution or scale changed: dock again on what is there now
+        if self.shown && !self.drag && self.trans.is_none() && self.mode != Mode::Full {
+            if !sys::monitor_exists(self.anchor.0, self.anchor.1) {
+                let (_, t, r, b, _) = sys::monitor_at(0, 0); // the primary monitor
+                self.anchor = (r - 1, (t + b) / 2);
+            }
+            let m = sys::monitor_at(self.anchor.0, self.anchor.1);
+            if m != self.screen {
+                self.anchor.0 = m.2 - 1; // stay on the right edge of that monitor
+                self.anchor.1 = self.anchor.1.clamp(m.1, m.3 - 1);
+                let first = self.screen.4 == 0.0;
+                self.screen = m;
+                if !first {
+                    let b = self.geometry(self.mode);
+                    self.set_bounds(b, now);
+                }
+            }
+            // the panel is as tall as its content, which arrives with the first sample and changes with
+            // drives plugged in or cards switched off
+            if self.mode == Mode::Panel {
+                let b = self.geometry(Mode::Panel);
+                if b != self.bounds {
+                    self.set_bounds(b, now);
+                }
             }
         }
         if let Some(h) = self.hwnd

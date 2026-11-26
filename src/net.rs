@@ -1,8 +1,8 @@
 //! Per-process network bytes, without administrator rights.
 //!
 //! Windows has no per-process network counter, and the kernel network provider needs elevation. The
-//! Winsock (AFD) provider can be traced by members of "Performance Log Users" (the default for an admin
-//! account), so we keep a real-time ETW session on it. Loopback traffic is included (it goes through
+//! Winsock (AFD) provider can be traced by an elevated process or by members of "Performance Log Users"
+//! (not a default membership: tools/install-admin.ps1 adds it), so we keep a real-time ETW session on it. Loopback traffic is included (it goes through
 //! Winsock too); Task Manager leaves it out.
 //!
 //! Which events carry the bytes was measured, not documented (Windows 11 26300):
@@ -22,7 +22,13 @@ use windows::Win32::System::Diagnostics::Etw::*;
 use windows::core::{GUID, PWSTR};
 
 const AFD: GUID = GUID::from_u128(0xe53c6823_7bb8_44bb_90dc_3f86090d48a6); // Microsoft-Windows-Winsock-AFD
-const SESSION: &str = "ResMon-net";
+/// Trace session names are global to the machine: one per Windows logon session, so that two users signed
+/// in at once (fast user switching, Remote Desktop) do not stop each other's trace.
+fn session() -> String {
+    let mut id = 0u32;
+    let _ = unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut id) };
+    format!("ResMon-net-{id}")
+}
 const SEND: [u16; 5] = [1003, 1005, 1007, 1011, 1013]; // send, sendto, sendto, sendmsg, sendmsg
 const RECV: [u16; 5] = [1004, 1006, 1009, 1012, 1015]; // recv, recvfrom, recvfrom, recvmsg, recvmsg
 
@@ -65,7 +71,7 @@ unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
 
 fn props() -> Vec<u64> {
     // EVENT_TRACE_PROPERTIES followed by room for the session name (u64 buffer for alignment)
-    let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (SESSION.len() + 1);
+    let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (session().len() + 1);
     let mut buf = vec![0u64; size / 8 + 1];
     let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
     unsafe {
@@ -81,7 +87,7 @@ fn props() -> Vec<u64> {
 
 /// Start the session and its consumer thread. Err tells why per-process network is unavailable.
 pub fn start() -> Result<(), String> {
-    let name = windows::core::HSTRING::from(SESSION);
+    let name = windows::core::HSTRING::from(session());
     let mut h = CONTROLTRACE_HANDLE::default();
     let mut buf = props();
     let mut st = unsafe { StartTraceW(&mut h, &name, buf.as_mut_ptr() as *mut _) };
@@ -91,7 +97,12 @@ pub fn start() -> Result<(), String> {
         st = unsafe { StartTraceW(&mut h, &name, buf.as_mut_ptr() as *mut _) };
     }
     if st.0 != 0 {
-        return Err(format!("Per-process network needs your user in \"Performance Log Users\" (trace error {})", st.0));
+        return Err(if st.0 == 5 {
+            // ERROR_ACCESS_DENIED: not elevated and not in the group that may run traces
+            "Per-process network needs ResMon run as administrator, or your user in \"Performance Log Users\" (tools/install-admin.ps1 does either)".into()
+        } else {
+            format!("Per-process network trace could not start (error {})", st.0)
+        });
     }
     // only the Winsock-side calls (keyword 0x4, level 4): the transport and fast-path events are the bulk
     let st = unsafe { EnableTraceEx2(h, &AFD, EVENT_CONTROL_CODE_ENABLE_PROVIDER.0, 4, 0x4, 0, 0, None) };
@@ -101,7 +112,7 @@ pub fn start() -> Result<(), String> {
     }
     *TOTALS.lock().unwrap() = Some(HashMap::new());
     std::thread::spawn(move || {
-        let mut wname: Vec<u16> = SESSION.encode_utf16().chain([0]).collect();
+        let mut wname: Vec<u16> = session().encode_utf16().chain([0]).collect();
         let mut lf = EVENT_TRACE_LOGFILEW { LoggerName: PWSTR(wname.as_mut_ptr()), ..Default::default() };
         lf.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         lf.Anonymous2.EventRecordCallback = Some(on_event);
@@ -117,7 +128,7 @@ pub fn start() -> Result<(), String> {
 /// Stop the session (a real-time session outlives its process otherwise).
 pub fn stop() {
     let mut b = props();
-    let _ = unsafe { ControlTraceW(CONTROLTRACE_HANDLE::default(), &windows::core::HSTRING::from(SESSION), b.as_mut_ptr() as *mut _, EVENT_TRACE_CONTROL_STOP) };
+    let _ = unsafe { ControlTraceW(CONTROLTRACE_HANDLE::default(), &windows::core::HSTRING::from(session()), b.as_mut_ptr() as *mut _, EVENT_TRACE_CONTROL_STOP) };
 }
 
 /// Snapshot of the cumulative (sent, received) bytes per PID; None if the session is not running.
